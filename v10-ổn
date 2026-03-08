@@ -1,0 +1,430 @@
+//+------------------------------------------------------------------+
+//|  XAU_PRO_V10 - IMPROVED                                         |
+//|  ENTRY : M15 EMA cross + M5 confirm (chong lenh nguoc)          |
+//|  FIX   : - Bat buoc M15 + M5 + RSI + Nen cung chieu            |
+//|           - Fresh cross phai co nen M15 xac nhan                 |
+//|           - Them BBand/ATR loc sideway                           |
+//|  EXIT  : 1. TP 25000 pts                                        |
+//|           2. BE: loi BE_Trigger pts → dong neu ve 0             |
+//|           3. EMA M15 dao chieu                                   |
+//|           4. Hard SL 10000 pts                                   |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade/Trade.mqh>
+
+input group "=== EMA ==="
+input int    FastEMA      = 9;
+input int    SlowEMA      = 21;
+
+input group "=== Filter ==="
+input int    RSI_Period   = 14;
+input double RSI_BuyMin   = 10.0;   // RSI phai TREN nguong nay de BUY
+input double RSI_SellMax  = 80.0;   // RSI phai DUOI nguong nay de SELL
+input double ATR_Min      = 2.5;    // ATR toi thieu chong sideway
+input double MinBodyPts   = 10.0;   // Than nen M5 toi thieu (pts)
+
+input group "=== Money Management ==="
+input double BaseLot      = 0.01;
+input double BaseEquity   = 1000;
+input double TP_Points    = 20000;
+input double HardSL_Pts   = 10000;
+input double BE_Trigger   = 10000;
+
+input group "=== Daily TP ==="
+input double DailyTP      = 50.0;
+input int    CooldownBars = 5;
+
+input ulong  Magic        = 20240901;
+
+//--- Globals
+CTrade   trade;
+int      hF5, hS5, hF15, hS15, hRSI, hATR;
+datetime lastBarM5    = 0;
+datetime lastBarM15   = 0;
+datetime lastClosedAt = 0;
+string   statusMsg    = "Starting...";
+bool     beArmed      = false;
+
+datetime todayDate       = 0;
+double   dailyRealizedPnL = 0;
+double   dailyStartEq    = 0;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(Magic);
+   hF5  = iMA(_Symbol, PERIOD_M5,  FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hS5  = iMA(_Symbol, PERIOD_M5,  SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hF15 = iMA(_Symbol, PERIOD_M15, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hS15 = iMA(_Symbol, PERIOD_M15, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hRSI = iRSI(_Symbol, PERIOD_M5, RSI_Period, PRICE_CLOSE);
+   hATR = iATR(_Symbol, PERIOD_M5, 14);
+
+   dailyStartEq     = AccountInfoDouble(ACCOUNT_EQUITY);
+   dailyRealizedPnL = 0;
+   todayDate        = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+
+   Print(StringFormat("=== XAU PRO V10 IMPROVED | TP=%.0f | SL=%.0f | RSI Buy>%.0f Sell<%.0f ===",
+         TP_Points, HardSL_Pts, RSI_BuyMin, RSI_SellMax));
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+double Buf(int h, int shift)
+{
+   double a[]; ArraySetAsSeries(a, true);
+   if(CopyBuffer(h, 0, 0, shift+1, a) < shift+1) return EMPTY_VALUE;
+   return a[shift];
+}
+
+double CalcAutoLot()
+{
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lotMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double symStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   int    steps   = (int)MathFloor(equity / BaseEquity);
+   if(steps < 1) steps = 1;
+   double lot = MathFloor((BaseLot * steps) / symStep) * symStep;
+   return MathMax(lotMin, MathMin(lotMax, lot));
+}
+
+void UpdateDailyPnL()
+{
+   datetime today = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   if(today != todayDate)
+   {
+      todayDate        = today;
+      dailyStartEq     = AccountInfoDouble(ACCOUNT_EQUITY);
+      dailyRealizedPnL = 0;
+      Print("=== New Day | StartEq=$", DoubleToString(dailyStartEq, 2));
+   }
+}
+
+void AddDailyPnL(double pnl) { dailyRealizedPnL += pnl; }
+
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic) continue;
+
+      ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double op  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double pnl = PositionGetDouble(POSITION_PROFIT);
+      double cur = (pt==POSITION_TYPE_BUY)
+                   ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                   : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double pts = (pt==POSITION_TYPE_BUY) ? (cur-op)/_Point : (op-cur)/_Point;
+
+      if(pts >= TP_Points)
+      {
+         AddDailyPnL(pnl);
+         trade.PositionClose(tk);
+         lastClosedAt = iTime(_Symbol, PERIOD_M1, 0);
+         beArmed      = false;
+         statusMsg    = StringFormat("TP +%.0f pts  $%+.2f | Daily:$%+.2f", pts, pnl, dailyRealizedPnL);
+         return;
+      }
+
+      if(pts <= -HardSL_Pts)
+      {
+         AddDailyPnL(pnl);
+         trade.PositionClose(tk);
+         lastClosedAt = iTime(_Symbol, PERIOD_M5, 0);
+         beArmed      = false;
+         statusMsg    = StringFormat("HARD SL -%.0f pts  $%.2f | Daily:$%+.2f", MathAbs(pts), pnl, dailyRealizedPnL);
+         return;
+      }
+
+      if(!beArmed && pts >= BE_Trigger)
+      {
+         beArmed   = true;
+         statusMsg = StringFormat("BE ARMED +%.0f pts - dong neu ve 0", pts);
+      }
+      if(beArmed && pts <= 0)
+      {
+         AddDailyPnL(pnl);
+         trade.PositionClose(tk);
+         lastClosedAt = iTime(_Symbol, PERIOD_M5, 0);
+         beArmed      = false;
+         statusMsg    = StringFormat("BE HIT %.0f pts  $%.2f | Daily:$%+.2f", pts, pnl, dailyRealizedPnL);
+         return;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+void CheckEMAExit(double f15_1, double s15_1)
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != Magic) continue;
+
+      ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double pnl = PositionGetDouble(POSITION_PROFIT);
+      double op  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur = (pt==POSITION_TYPE_BUY)
+                   ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                   : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double pts = (pt==POSITION_TYPE_BUY) ? (cur-op)/_Point : (op-cur)/_Point;
+
+      bool exitBuy  = (pt==POSITION_TYPE_BUY)  && (f15_1 < s15_1);
+      bool exitSell = (pt==POSITION_TYPE_SELL) && (f15_1 > s15_1);
+
+      if(exitBuy || exitSell)
+      {
+         AddDailyPnL(pnl);
+         trade.PositionClose(tk);
+         lastClosedAt = iTime(_Symbol, PERIOD_M5, 0);
+         beArmed      = false;
+         statusMsg    = StringFormat("EMA M15 EXIT %s  %+.0f pts  $%+.2f | Daily:$%+.2f",
+                        pt==POSITION_TYPE_BUY?"BUY":"SELL", pts, pnl, dailyRealizedPnL);
+         Print(statusMsg);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+void UpdateChart(double f5, double s5, double f15, double s15, double rsi, double atr)
+{
+   int x = 30, y = 30, step = 18;
+
+   color clrM5  = (f5  > s5)  ? clrLime : clrRed;
+   color clrM15 = (f15 > s15) ? clrLime : clrRed;
+   color clrRSI = (rsi > 50)  ? clrDeepSkyBlue : clrOrange;
+
+   double floatingNow = 0;
+   for(int i = 0; i < PositionsTotal(); i++) {
+      if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == Magic)
+         floatingNow += PositionGetDouble(POSITION_PROFIT);
+   }
+
+   double totalDayPnL = dailyRealizedPnL + floatingNow;
+   color clrProfit = (totalDayPnL >= 0)           ? clrLime : clrRed;
+   color clrDaily  = (dailyRealizedPnL >= DailyTP) ? clrGold : clrCyan;
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin     = AccountInfoDouble(ACCOUNT_MARGIN);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   color  clrEquity  = (equity >= balance) ? clrLime : clrRed;
+
+   CreateLabel("db_0",  "╔══════════════════════════════════════════════╗", x, y, clrWhite); y+=step;
+   CreateLabel("db_1",  StringFormat("║  GIAO DICH TU DONG - HOANGDEV  [Lot: %.2f]", CalcAutoLot()), x, y, clrGold); y+=step;
+   CreateLabel("db_2",  "╠══════════════════════════════════════════════╣", x, y, clrWhite); y+=step;
+   CreateLabel("db_3",  StringFormat("║ [M5 ] Xu huong: %-10s [%+.0f pts]", (f5>s5?"TANG":"GIAM"),   (f5-s5)/_Point),   x, y, clrM5);  y+=step;
+   CreateLabel("db_4",  StringFormat("║ [M15] Xu huong: %-10s [%+.0f pts]", (f15>s15?"TANG":"GIAM"), (f15-s15)/_Point), x, y, clrM15); y+=step;
+   CreateLabel("db_5",  StringFormat("║ RSI(M5): %.1f | ATR(M5): %.2f", rsi, atr), x, y, clrRSI); y+=step;
+   CreateLabel("db_6",  "╠══════════════════════════════════════════════╣", x, y, clrWhite); y+=step;
+   CreateLabel("db_7",  "║ Trang thai: " + statusMsg, x, y, clrYellow); y+=step;
+   CreateLabel("db_8",  "╠══════════════════════════════════════════════╣", x, y, clrWhite); y+=step;
+   CreateLabel("db_9",  StringFormat("║ Lai da chot hom nay  : $%+.2f", dailyRealizedPnL), x, y, (dailyRealizedPnL>=0?clrLime:clrRed)); y+=step;
+   CreateLabel("db_10", StringFormat("║ Lai dang chay (float): $%+.2f", floatingNow),       x, y, (floatingNow>=0?clrLime:clrRed));      y+=step;
+   CreateLabel("db_11", StringFormat("║ TONG LAI HOM NAY     : $%+.2f / $%.2f", totalDayPnL, DailyTP), x, y, clrProfit); y+=step;
+   string dailyMsg = (dailyRealizedPnL >= DailyTP) ? "DAT MUC TIEU NGAY! NGHI NGOI" : "DANG GIAO DICH...";
+   CreateLabel("db_12", "║ >> " + dailyMsg, x, y, clrDaily); y+=step;
+   CreateLabel("db_13", "╠══════════════════════════════════════════════╣", x, y, clrWhite); y+=step;
+   CreateLabel("db_14", StringFormat("║ Balance  : $%.2f", balance),                             x, y, clrWhite);   y+=step;
+   CreateLabel("db_15", StringFormat("║ Equity   : $%.2f  [%+.2f]", equity, equity-balance),     x, y, clrEquity);  y+=step;
+   CreateLabel("db_16", StringFormat("║ Margin   : $%.2f  |  Free: $%.2f", margin, freeMargin),  x, y, clrSilver);  y+=step;
+   CreateLabel("db_17", "╚══════════════════════════════════════════════╝", x, y, clrWhite);
+
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double f5_1  = Buf(hF5,  1);
+   double s5_1  = Buf(hS5,  1);
+   double f5_2  = Buf(hF5,  2);
+   double s5_2  = Buf(hS5,  2);
+   double f15_1 = Buf(hF15, 1);
+   double s15_1 = Buf(hS15, 1);
+   double f15_2 = Buf(hF15, 2);
+   double s15_2 = Buf(hS15, 2);
+   double rsi   = Buf(hRSI, 1);
+   double atr   = Buf(hATR, 1);
+
+   UpdateDailyPnL();
+   ManagePositions();
+   UpdateChart(f5_1, s5_1, f15_1, s15_1, rsi, atr);
+
+   datetime curM15 = iTime(_Symbol, PERIOD_M15, 0);
+   datetime curM5  = iTime(_Symbol, PERIOD_M5,  0);
+
+   if(curM15 != lastBarM15)
+   {
+      lastBarM15 = curM15;
+      if(f15_1 != EMPTY_VALUE && s15_1 != EMPTY_VALUE)
+         CheckEMAExit(f15_1, s15_1);
+   }
+
+   if(curM5 == lastBarM5) return;
+   lastBarM5 = curM5;
+   if(PositionsTotal() > 0) return;
+
+   if(f5_1==EMPTY_VALUE || f15_1==EMPTY_VALUE ||
+      rsi==EMPTY_VALUE  || atr==EMPTY_VALUE)
+   { statusMsg = "Indicators loading..."; return; }
+
+   if(atr < ATR_Min)
+   { statusMsg = StringFormat("Sideway ATR=%.2f (min %.2f)", atr, ATR_Min); return; }
+
+   if(lastClosedAt > 0)
+   {
+      int elapsed = iBarShift(_Symbol, PERIOD_M1, lastClosedAt, false);
+      if(elapsed < CooldownBars)
+      {
+         statusMsg = StringFormat("Cooldown... con %d nen", CooldownBars - elapsed);
+         return;
+      }
+   }
+
+   // Nen M5 vua dong
+   double c1   = iClose(_Symbol, PERIOD_M5, 1);
+   double o1   = iOpen (_Symbol, PERIOD_M5, 1);
+   double h1   = iHigh (_Symbol, PERIOD_M5, 1);
+   double l1   = iLow  (_Symbol, PERIOD_M5, 1);
+   double body = MathAbs(c1 - o1) / _Point;
+   bool   bull = (c1 > o1);
+   bool   bear = (c1 < o1);
+
+   // Nen M15 vua dong (nen [1] tren M15)
+   double c15  = iClose(_Symbol, PERIOD_M15, 1);
+   double o15  = iOpen (_Symbol, PERIOD_M15, 1);
+   bool   bull15 = (c15 > o15);
+   bool   bear15 = (c15 < o15);
+
+   // Trang thai EMA
+   bool m15Up   = (f15_1 > s15_1);
+   bool m15Down = (f15_1 < s15_1);
+   bool m5Up    = (f5_1  > s5_1);
+   bool m5Down  = (f5_1  < s5_1);
+
+   // Khoang cach EMA M15 (do manh cua trend)
+   double emaDiffM15 = MathAbs(f15_1 - s15_1) / _Point;
+
+   // Fresh cross M15 vua xay ra (nen [1] va [2])
+   bool freshBuy  = (f15_1 > s15_1) && (f15_2 <= s15_2);
+   bool freshSell = (f15_1 < s15_1) && (f15_2 >= s15_2);
+
+   // ================================================================
+   //  BUY - TAT CA dieu kien phai thoa man cung luc
+   // ================================================================
+   //  [1] M15 dang TANG (EMA9 > EMA21)
+   //  [2] M5 dang TANG (EMA9 > EMA21) - cung chieu
+   //  [3] Nen M5 xanh + than du lon
+   //  [4] Nen M15 xanh (xac nhan khung lon)
+   //  [5] RSI > 50 (momentum tang)
+   //  [6] EMA M15 du rong (tranh nhieu khi hai duong sat nhau)
+   //  HOAC: freshBuy vua xay ra + M5 cung len + nen xanh ca hai khung
+   // ================================================================
+   bool normalBuy = m15Up   &&          // [1] M15 tang
+                    m5Up    &&          // [2] M5 tang
+                    bull    &&          // [3] Nen M5 xanh
+                    bull15  &&          // [4] Nen M15 xanh
+                    body >= MinBodyPts &&  // [3] Than nen du lon
+                    rsi  >= RSI_BuyMin &&  // [5] RSI xac nhan tang
+                    emaDiffM15 >= 10;   // [6] EMA M15 du rong
+
+   bool freshBuyOK = freshBuy  &&      // M15 vua cat len
+                     m5Up      &&      // M5 cung tang
+                     bull      &&      // Nen M5 xanh
+                     bull15    &&      // Nen M15 xanh xac nhan cross
+                     body >= MinBodyPts;
+
+   if(normalBuy || freshBuyOK)
+   {
+      double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      beArmed       = false;
+      double lotNow = CalcAutoLot();
+      if(trade.Buy(lotNow, _Symbol, ask, 0, 0, "V10"))
+         statusMsg = StringFormat("BUY @ %.2f  RSI=%.1f  Lot=%.2f  %s",
+                     ask, rsi, lotNow, freshBuyOK?"[FRESH]":"[TREND]");
+      else
+         statusMsg = StringFormat("BUY FAILED %d", GetLastError());
+      return;
+   }
+
+   // ================================================================
+   //  SELL - Dieu kien can bang: du chac nhung khong qua chat
+   // ================================================================
+   //  [1] M15 dang GIAM (bat buoc - khung chinh)
+   //  [2] M5 dang GIAM (bat buoc - cung chieu)
+   //  [3] Nen M5 do + than du lon
+   //  [4] RSI < 55 (khong yeu cau < 50 vi RSI thuong bounce khi downtrend)
+   //  [5] KHONG freshBuy (tranh ban sau EMA cat len)
+   //  BOT YEU CAU nen M15 do: downtrend van co nen xanh hoi phuc binh thuong
+   //  HOAC: freshSell + M5 giam + nen M5 do (khong can nen M15 do)
+   // ================================================================
+   bool normalSell = m15Down  &&          // [1] M15 giam - bat buoc
+                     m5Down   &&          // [2] M5 giam - bat buoc
+                     bear     &&          // [3] Nen M5 do
+                     body >= MinBodyPts &&    // [3] Than nen du lon
+                     rsi  <= RSI_SellMax+5 && // [4] RSI < 55 (noi long tu 50)
+                     !freshBuy;           // [5] Tranh ban sau khi vua cross len
+
+   bool freshSellOK = freshSell &&       // M15 vua cat xuong
+                      m5Down   &&        // M5 cung giam
+                      bear     &&        // Nen M5 do
+                      body >= MinBodyPts &&
+                      !m15Up;            // Chac chan khong con uptrend
+
+   if(normalSell || freshSellOK)
+   {
+      double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      beArmed       = false;
+      double lotNow = CalcAutoLot();
+      if(trade.Sell(lotNow, _Symbol, bid, 0, 0, "V10"))
+         statusMsg = StringFormat("SELL @ %.2f  RSI=%.1f  Lot=%.2f  %s",
+                     bid, rsi, lotNow, freshSellOK?"[FRESH]":"[TREND]");
+      else
+         statusMsg = StringFormat("SELL FAILED %d", GetLastError());
+      return;
+   }
+
+   // Hien thi ly do chua vao lenh
+   string reasonBuy  = "";
+   string reasonSell = "";
+
+   if(!m15Up)   reasonBuy  += "M15 giam ";
+   if(!m5Up)    reasonBuy  += "M5 giam ";
+   if(!bull)    reasonBuy  += "Nen do ";
+   if(!bull15)  reasonBuy  += "M15nen do ";
+   if(rsi < RSI_BuyMin) reasonBuy += StringFormat("RSI=%.0f<%.0f ", rsi, RSI_BuyMin);
+
+   if(!m15Down) reasonSell += "M15 tang ";
+   if(!m5Down)  reasonSell += "M5 tang ";
+   if(!bear)    reasonSell += "Nen xanh ";
+   // bear15 da bo - khong yeu cau nen M15 do
+   if(rsi > RSI_SellMax) reasonSell += StringFormat("RSI=%.0f>%.0f ", rsi, RSI_SellMax);
+
+   statusMsg = StringFormat("Wait BUY[%s] | SELL[%s] | ATR:%.2f EMA:%.0f",
+      reasonBuy==""?"OK":reasonBuy,
+      reasonSell==""?"OK":reasonSell,
+      atr, emaDiffM15);
+}
+
+//+------------------------------------------------------------------+
+void CreateLabel(string name, string text, int x, int y, color clr, int fontSize=9)
+{
+   if(ObjectFind(0, name) < 0)      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetString(0,  name, OBJPROP_TEXT,      text);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  fontSize);
+   ObjectSetString(0,  name, OBJPROP_FONT,      "Courier New");
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, "db_");
+}
