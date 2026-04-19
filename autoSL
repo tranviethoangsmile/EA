@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                        AutoSL_H1_XAUUSD.mq5     |
-//|   AutoSL H1 + EMA M5 Canvas Chart + AutoClose + BE+ | Dash v8   |
+//|  AutoSL H1 + EMA M5 Canvas Chart + AutoClose + BE+ | Dash v10   |
 //+------------------------------------------------------------------+
 #property copyright   "Custom EA"
-#property version     "8.00"
+#property version     "10.00"
 #property strict
-#property description "AutoSL H1 | EMA M5 Visual Canvas | AutoClose | Breakeven+ | Dashboard"
+#property description "AutoSL H1 | EMA M5 Visual Canvas | AutoClose | Breakeven+ | Dashboard | Live Scale"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -46,44 +46,41 @@ input int      InpMaxLog        = 5;
 //======================================================================
 //
 //  ╔══════════════════════════════════════════════════════════════════╗
-//  ║   MASTER SCALE — BIẾN DUY NHẤT ĐỂ THAY ĐỔI KÍCH THƯỚC         ║
+//  ║   MASTER SCALE — GIÁ TRỊ MẶC ĐỊNH KHI KHỞI ĐỘNG               ║
 //  ║                                                                  ║
+//  ║   80  = nhỏ gọn                                                 ║
 //  ║   100 = chuẩn (panel ~480px)                                    ║
-//  ║   120 = to hơn 20%  (panel ~576px)  ← khuyến nghị màn HD      ║
-//  ║   150 = to hơn 50%  (panel ~720px)  ← màn 2K/4K               ║
-//  ║   200 = gấp đôi     (panel ~960px)                              ║
+//  ║   120 = to hơn 20%  ← khuyến nghị màn HD                      ║
+//  ║   150 = to hơn 50%  ← màn 2K/4K                               ║
+//  ║   200 = gấp đôi                                                 ║
 //  ║                                                                  ║
-//  ║   CHỈ SỬA CON SỐ NÀY — tất cả còn lại tự điều chỉnh           ║
+//  ║   Hoặc dùng nút  [ S ][ M ][ L ][ XL ]  trên dashboard         ║
+//  ║   để đổi kích thước NGAY TRÊN BIỂU ĐỒ, không cần recompile!   ║
 //  ╚══════════════════════════════════════════════════════════════════╝
 //
-#define DASH_SCALE  120
+#define DASH_SCALE  100    // ← giá trị compile-time mặc định (bị ghi đè bởi gDashScale)
 
 //======================================================================
-//  SCALING ENGINE  (không cần chỉnh, chạy tự động theo DASH_SCALE)
+//  SCALING ENGINE — runtime, dùng gDashScale thay DASH_SCALE
+//  → toàn bộ panel rebuild ngay khi click nút S/M/L/XL
 //======================================================================
-
-// Macro scale dùng cho #define khác (compile-time)
-// Làm tròn: (n * scale + 50) / 100
-#define _SZ(n)   ((int)(((long)(n) * (DASH_SCALE) + 50L) / 100L))
-
-// Font scale: min 6pt (MT5 không cho nhỏ hơn)
+#define _SZ(n)   ((int)(((long)(n) * (DASH_SCALE) + 50L) / 100L))   // compile-time (chỉ dùng cho CANVAS_*)
 #define _FS(n)   (_SZ(n) < 6 ? 6 : _SZ(n))
 
-// Hàm runtime (dùng trong code, hỗ trợ biểu thức phức tạp hơn)
-int sz(int n){ return (int)(((long)n*(DASH_SCALE)+50L)/100L); }
-int fs(int n){ int v=(int)(((long)n*(DASH_SCALE)+50L)/100L); return v<6?6:v; }
+int gDashScale = DASH_SCALE;   // ← runtime master scale, thay đổi khi click nút
+
+// Tất cả layout dùng sz()/fs() qua gDashScale — rebuild tức thì khi scale thay đổi
+int sz(int n){ return (int)(((long)n * gDashScale + 50L) / 100L); }
+int fs(int n){ int v=(int)(((long)n * gDashScale + 50L) / 100L); return v<6?6:v; }
 
 //======================================================================
-//  KÍCH THƯỚC CƠ SỞ (thiết kế tại DASH_SCALE = 100)
-//  → TẤT CẢ tự scale khi thay đổi DASH_SCALE
+//  CANVAS SIZE  (compile-time, dùng _SZ)
 //======================================================================
-
-// Canvas EMA
 #define CANVAS_NAME   "d_ema_canvas"
-#define CANVAS_W      (_SZ(480) - _SZ(16))   // rộng bằng panel trừ margin
-#define CANVAS_H      _SZ(160)                // chiều cao vùng vẽ EMA
+#define CANVAS_W      _SZ(464)    // = PW(480) - margin_left(8) - margin_right(8) = 464
+#define CANVAS_H      _SZ(160)
 
-//--- Palette (màu — không scale)
+//--- Palette
 #define C_BG        C'12,16,24'
 #define C_HDR       C'16,20,32'
 #define C_CARD      C'20,26,40'
@@ -102,6 +99,43 @@ int fs(int n){ int v=(int)(((long)n*(DASH_SCALE)+50L)/100L); return v<6?6:v; }
 #define C_CYAN      C'50,195,215'
 #define C_YELLOW    C'235,215,55'
 #define C_PURPLE    C'165,80,225'
+
+//======================================================================
+//  LAYOUT CONSTANTS — tất cả dùng sz() tại runtime
+//  Định nghĩa tập trung, tránh "magic number" rải rác
+//======================================================================
+
+// Kích thước cố định
+#define PW_BASE      480    // panel width base
+#define MARGIN_H     8      // margin ngang (trái/phải nội dung)
+#define CARD_GAP     6      // gap giữa cards
+#define SECT_GAP     10     // gap trước section label
+
+// Chiều cao từng khối (base tại scale=100)
+#define H_HDR        32
+#define H_CRD        62
+#define H_SL         88
+#define H_CD         22
+#define H_BT         20
+#define H_RLOG       16
+#define H_FT         16
+#define H_EMA_ACC    2
+#define H_EMA_SH     22
+#define H_EMA_CTRL   26
+#define H_EMA_SIG    22
+#define H_EMA_RSN    20
+#define H_EMA_SB     5
+#define H_EMA_PAD    8
+
+// Gaps dọc (base tại scale=100)
+#define GAP_HDR_OV   38     // header → section Overview
+#define GAP_SECT_LBL 12     // chiều cao chữ section label
+#define GAP_CRD_EMA  10     // card → section EMA
+#define GAP_EMA_SL   11     // EMA card → section SL
+#define GAP_SLC      8      // SL card → countdown
+#define GAP_CD_BT    6      // countdown → batch
+#define GAP_BT_LOG   8      // batch → log section
+#define GAP_LOG_FT   12     // log → footer
 
 //======================================================================
 //  GLOBALS
@@ -135,24 +169,42 @@ string gObjs[];
 int hFast, hMid, hSlow;
 
 //======================================================================
-//  LAYOUT HELPERS  — tính Y canvas, dùng chung BuildPanel + InitCanvas
+//  LAYOUT HELPERS — tập trung tính toán layout tại một chỗ
+//  Mọi hàm BuildPanel/InitCanvas đều gọi các hàm này
 //======================================================================
 
-// Tất cả chiều cao đều dùng sz() để scale theo DASH_SCALE
-// Hàm này trả về Y tuyệt đối của vùng vẽ canvas trên màn hình
+// Chiều rộng panel runtime
+int PanelW()   { return sz(PW_BASE); }
+
+// Chiều rộng vùng canvas — runtime theo gDashScale
+// CANVAS_W/_H (compile-time _SZ) chỉ dùng cho CreateBitmapLabel lần đầu,
+// CanvasW()/CanvasH() dùng cho mọi tính toán layout và Resize()
+int CanvasW()  { return sz(PW_BASE - MARGIN_H*2); }   // 480 - 16 = 464
+int CanvasH()  { return sz(160); }
+
+// Tổng chiều cao card EMA (tính từ các thành phần)
+int EmaCardH()
+{
+   return sz(H_EMA_ACC) + sz(H_EMA_SH) + CanvasH()
+        + sz(4) + sz(H_EMA_CTRL) + sz(4)
+        + sz(H_EMA_SIG) + sz(H_EMA_RSN) + sz(H_EMA_SB) + sz(H_EMA_PAD);
+}
+
+// Y tuyệt đối của vùng bắt đầu canvas bitmap (khớp BuildPanel)
+// Phải giống hệt cách BuildPanel tính ecv_y
 int CalcCanvasScreenY()
 {
-   // Chuỗi Y: panel_top → header → section label → cards → EMA label → EMA subheader → canvas
    int y = InpPanelY;
-   y += sz(32);    // header height
-   y += sz(38);    // khoảng cách header → label "OVERVIEW"
-   y += sz(12);    // chiều cao chữ section label
-   y += sz(62);    // chiều cao card metric
-   y += sz(10);    // gap trước section EMA
-   y += sz(13);    // chiều cao chữ label "EMA ANALYSIS"
-   y += sz(2);     // top accent bar
-   y += sz(22);    // sub-header height
-   // Đây là Y của viền canvas → canvas nằm +1px bên trong viền
+   y += sz(H_HDR);                          // header
+   y += sz(GAP_HDR_OV);                     // gap header → Overview label
+   y += sz(GAP_SECT_LBL);                   // Overview label height
+   y += sz(H_CRD);                          // 4 metric cards
+   y += sz(GAP_CRD_EMA);                    // gap → EMA section
+   y += sz(GAP_SECT_LBL);                   // EMA label height
+   // eby = Y bắt đầu card EMA outer
+   y += sz(H_EMA_ACC);                      // accent bar
+   y += sz(H_EMA_SH);                       // sub-header
+   // ecv_y = y bây giờ = đỉnh canvas
    return y;
 }
 
@@ -173,8 +225,10 @@ int OnInit()
 
    if(!ReinitEmaHandles()) return INIT_FAILED;
 
-   Log("EA v8.0 | " + gSym + " | Scale=" + (string)DASH_SCALE + "% | EMA " + (string)gEmaFast + "/" + (string)gEmaMid + "/" + (string)gEmaSlow, "info");
-   Log(StringFormat("SL buffer=%.0fpt | BE $%.0f>>+$%.0f | Close phut %02d", InpExtraPoints, InpBETrigger, InpBELock, InpCloseMinute), "info");
+   Log("EA v10.0 | " + gSym + " | Scale=" + (string)gDashScale + "% | EMA "
+       + (string)gEmaFast + "/" + (string)gEmaMid + "/" + (string)gEmaSlow, "info");
+   Log(StringFormat("SL buffer=%.0fpt | BE $%.0f>>+$%.0f | Close phut %02d",
+       InpExtraPoints, InpBETrigger, InpBELock, InpCloseMinute), "info");
 
    BuildPanel();
    if(!InitCanvas()) Log("Canvas init failed","err");
@@ -216,10 +270,13 @@ bool InitCanvas()
 {
    if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
 
-   int cx = InpPanelX + sz(8);
+   // Canvas đặt tại px + sz(MARGIN_H), khớp với viền d_ema_cvbrd trong BuildPanel
+   int cx = InpPanelX + sz(MARGIN_H);
    int cy = CalcCanvasScreenY();
+   int cw = CanvasW();
+   int ch = CanvasH();
 
-   if(!gEmaCanvas.CreateBitmapLabel(0, 0, CANVAS_NAME, cx, cy, CANVAS_W, CANVAS_H, COLOR_FORMAT_ARGB_NORMALIZE))
+   if(!gEmaCanvas.CreateBitmapLabel(0, 0, CANVAS_NAME, cx, cy, cw, ch, COLOR_FORMAT_ARGB_NORMALIZE))
       return false;
 
    ObjectSetInteger(0, CANVAS_NAME, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
@@ -236,8 +293,9 @@ void DrawEmaCanvas()
 {
    if(!gCanvasReady) return;
 
-   int W = CANVAS_W, H = CANVAS_H;
-   int bars = MathMax(40, sz(75));   // số nến tự scale
+   int W = CanvasW();
+   int H = CanvasH();
+   int bars = MathMax(40, sz(75));
 
    double ef[], em[], es[];
    ArraySetAsSeries(ef,true); ArraySetAsSeries(em,true); ArraySetAsSeries(es,true);
@@ -260,6 +318,12 @@ void DrawEmaCanvas()
    int cW = W - PL - PR;
    int cH = H - PT - PB;
    double barW = (double)cW / bars;
+
+   // Resize canvas nếu kích thước thay đổi (do reinit)
+   if(gEmaCanvas.Width() != W || gEmaCanvas.Height() != H)
+   {
+      gEmaCanvas.Resize(W, H);
+   }
 
    gEmaCanvas.Erase(ColorToARGB(C'5,9,17',255));
 
@@ -319,7 +383,7 @@ void DrawEmaCanvas()
       int lblW=(int)StringLen(priceStr)*8;
       int xLbl=MathMax(PL,MathMin(W-PR-lblW,xDot-lblW/2));
       gEmaCanvas.FillRectangle(xLbl-3,yLbl-1,xLbl+lblW+2,yLbl+lblH+1,ColorToARGB(C'5,9,17',210));
-      gEmaCanvas.FontSet("Arial Bold",9);
+      gEmaCanvas.FontSet("Arial Bold",15);
       gEmaCanvas.TextOut(xLbl,yLbl,priceStr,lblC);
    }
 
@@ -331,6 +395,7 @@ void DrawEmaCanvas()
       gEmaCanvas.PixelSet(x+1,yP,ColorToARGB(C'160,168,195',160));
    }
 
+   // Legend dots phía góc phải
    gEmaCanvas.FillCircle(W-52,PT+5,3,ColorToARGB(C_YELLOW,230));
    gEmaCanvas.FillCircle(W-36,PT+5,3,ColorToARGB(C_CYAN,  220));
    gEmaCanvas.FillCircle(W-20,PT+5,3,ColorToARGB(C_ORANGE,210));
@@ -366,17 +431,46 @@ void OnChartEvent(const int id,const long& lp,const double& dp,const string& sp)
 {
    if(id != CHARTEVENT_OBJECT_CLICK) return;
 
+   //--------------------------------------------------------------------
+   //  HIDE / SHOW
+   //--------------------------------------------------------------------
    if(sp == "d_btn_hide")
    {
       gHidden = !gHidden;
       PanelToggle();
-      ObjTxt("d_btn_hide", gHidden ? "[ SHOW ]" : "[ HIDE ]");
+      ObjTxt("d_btn_hide", gHidden ? "[ SHOW ]" : "[ X ]");
       if(gCanvasReady)
          ObjectSetInteger(0,CANVAS_NAME,OBJPROP_TIMEFRAMES,gHidden?OBJ_NO_PERIODS:OBJ_ALL_PERIODS);
       ChartRedraw(0);
       return;
    }
 
+   //--------------------------------------------------------------------
+   //  SCALE BUTTONS  — S / M / L / XL
+   //  Rebuild toàn bộ panel + canvas ngay lập tức
+   //--------------------------------------------------------------------
+   int newScale = 0;
+   if(sp == "d_btn_sc_s" ) newScale = 80;
+   if(sp == "d_btn_sc_m" ) newScale = 100;
+   if(sp == "d_btn_sc_l" ) newScale = 120;
+   if(sp == "d_btn_sc_xl") newScale = 150;
+
+   if(newScale > 0 && newScale != gDashScale)
+   {
+      gDashScale = newScale;
+      Log(StringFormat("Scale → %d%%", gDashScale), "info");
+      // Rebuild toàn bộ panel + canvas với scale mới
+      BuildPanel();
+      if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
+      if(!InitCanvas()) Log("Canvas init failed after scale change","err");
+      DrawEmaCanvas();
+      ChartRedraw(0);
+      return;
+   }
+
+   //--------------------------------------------------------------------
+   //  EMA PERIOD BUTTONS
+   //--------------------------------------------------------------------
    bool changed = false;
    if(sp=="d_btn_f_dec"){ if(gEmaFast>2){ gEmaFast-=1; if(gEmaFast>=gEmaMid) gEmaFast=gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; } }
    if(sp=="d_btn_f_inc"){ gEmaFast+=1; if(gEmaFast>=gEmaMid) gEmaFast=gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; }
@@ -639,13 +733,25 @@ void Lbl(string n,int x,int y,string txt,color clr,int fsize,bool bold=false)
    ObjectSetInteger(0,n,OBJPROP_ZORDER,10); Track(n);
 }
 
+//----------------------------------------------------------------------
+//  Btn — căn giữa chữ theo chiều ngang dựa trên pixel thực
+//  avgCharW: ước lượng pixel/ký tự ở font size fsize (Arial Bold)
+//  MT5 không expose text-width API → dùng heuristic: ~0.6 * fsize * scale
+//  Tốt hơn nhiều so với StringLen(txt)*fsize cố định
+//----------------------------------------------------------------------
 void Btn(string n,int x,int y,int w,int h,string txt,color bg,color clr,int fsize)
 {
    Rect(n+"_bg",x,y,w,h,bg,C_BDR2,1);
    ObjectCreate(0,n,OBJ_LABEL,0,0,0);
-   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x+MathMax(1,(w-(int)StringLen(txt)*fsize)/2));
-   ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y+(h-fsize*2)/2+1);
-   ObjectSetString(0,n,OBJPROP_TEXT,txt); ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+
+   // Ước lượng chiều rộng text: 0.65 pixel/unit/fontsize (Arial Bold)
+   int textW = (int)(StringLen(txt) * fsize * 0.65);
+   int offX  = MathMax(2, (w - textW) / 2);
+   int offY  = MathMax(1, (h - fsize*2) / 2 + 1);
+
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE, x + offX);
+   ObjectSetInteger(0,n,OBJPROP_YDISTANCE, y + offY);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt);    ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fsize); ObjectSetString(0,n,OBJPROP_FONT,"Arial Bold");
    ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER);
    ObjectSetInteger(0,n,OBJPROP_SELECTABLE,true); ObjectSetInteger(0,n,OBJPROP_BACK,false);
@@ -664,222 +770,304 @@ void ObjVis(string n,bool v)    { ObjectSetInteger(0,n,OBJPROP_TIMEFRAMES,v?OBJ_
 void BuildPanel()
 {
    ObjDeleteAll();
-   int px=InpPanelX, py=InpPanelY;
+   int px = InpPanelX;
+   int py = InpPanelY;
 
    // ════════════════════════════════════════════════════════════
-   //  KÍCH THƯỚC CƠ SỞ (tại DASH_SCALE=100)
-   //  Thay đổi DASH_SCALE ở đầu file — tất cả tự scale theo
+   //  KẾT HỢP KÍCH THƯỚC — runtime, tất cả qua sz()/fs()
    // ════════════════════════════════════════════════════════════
 
-   int PW_      = sz(480);  // chiều rộng panel
-   int CW_      = PW_ - sz(16);  // chiều rộng canvas (PW_ - margin)
+   int PW_       = sz(PW_BASE);         // chiều rộng panel
+   int MH        = sz(MARGIN_H);        // margin ngang
 
-   // ── Kích thước từng khu vực ──────────────────────────────
-   int HDR_H    = sz(32);   // chiều cao header
-   int CRD_W    = (PW_ - sz(10) - sz(6)*3) / 4;  // chiều rộng card tự chia 4 cột đều
-   int CRD_H    = sz(62);   // chiều cao card metric
-   int SL_H     = sz(88);   // chiều cao card SL / AutoClose
-   int CD_H     = sz(22);   // chiều cao countdown bar
-   int BT_H     = sz(20);   // chiều cao batch bar
-   int RLOG_    = sz(16);   // chiều cao mỗi dòng log
-   int FT_H     = sz(16);   // chiều cao footer
+   // Chiều cao các khối
+   int HDR_H     = sz(H_HDR);
+   int CRD_H     = sz(H_CRD);
+   int SL_H      = sz(H_SL);
+   int CD_H      = sz(H_CD);
+   int BT_H      = sz(H_BT);
+   int RLOG_     = sz(H_RLOG);
+   int FT_H      = sz(H_FT);
+   int EMA_ACC   = sz(H_EMA_ACC);
+   int EMA_SH    = sz(H_EMA_SH);
+   int EMA_CV    = CanvasH();           // runtime, = sz(160)
+   int EMA_CTRL  = sz(H_EMA_CTRL);
+   int EMA_SIG   = sz(H_EMA_SIG);
+   int EMA_RSN   = sz(H_EMA_RSN);
+   int EMA_SB    = sz(H_EMA_SB);
+   int EMA_PAD   = sz(H_EMA_PAD);
+   int EMA_CARD  = EmaCardH();          // tổng chiều cao card EMA
 
-   // ── EMA card: breakdown từng phần ────────────────────────
-   int EMA_ACC  = sz(2);    // accent bar vàng trên đầu card
-   int EMA_SH   = sz(22);   // sub-header (hiện M5 + legend)
-   int EMA_CV   = CANVAS_H; // chiều cao canvas = CANVAS_H macro (tự scale)
-   int EMA_CTRL = sz(26);   // controls +/- EMA periods
-   int EMA_SIG  = sz(22);   // hàng TREND / SIGNAL / STRENGTH
-   int EMA_RSN  = sz(20);   // dòng lý do (reason)
-   int EMA_SB   = sz(5);    // score bar
-   int EMA_PAD  = sz(8);    // padding đáy card EMA
-   // Tổng chiều cao card EMA (tự cộng, không hardcode):
-   int EMA_CARD = EMA_ACC + EMA_SH + EMA_CV + sz(4) + EMA_CTRL + sz(4) + EMA_SIG + EMA_RSN + EMA_SB + EMA_PAD;
+   // Gaps
+   int G_HDR_OV  = sz(GAP_HDR_OV);
+   int G_LBL     = sz(GAP_SECT_LBL);
+   int G_CRD_EMA = sz(GAP_CRD_EMA);
+   int G_EMA_SL  = sz(GAP_EMA_SL);
+   int G_SLC     = sz(GAP_SLC);
+   int G_CD_BT   = sz(GAP_CD_BT);
+   int G_BT_LOG  = sz(GAP_BT_LOG);
+   int G_LOG_FT  = sz(GAP_LOG_FT);
 
-   // ── Font sizes (tất cả scale theo DASH_SCALE, min 6pt) ───
-   int F_HDR    = fs(10);   // tiêu đề header
-   int F_SECT   = fs(7);    // nhãn section (OVERVIEW, EMA...)
-   int F_CLBL   = fs(7);    // nhãn trong card (POSITIONS, P&L...)
-   int F_CVAL   = fs(18);   // giá trị lớn trong card (số lệnh, BE...)
-   int F_CVAL2  = fs(14);   // giá trị P&L (hơi nhỏ hơn để vừa dấu +/-)
-   int F_BODY   = fs(8);    // body text thông thường
-   int F_VAL    = fs(9);    // giá trị nhỏ (SCORE, SIGNAL value...)
-   int F_BTN    = fs(9);    // chữ trên nút bấm
+   // Font sizes
+   int F_HDR     = fs(10);
+   int F_SECT    = fs(7);
+   int F_CLBL    = fs(7);
+   int F_CVAL    = fs(18);
+   int F_CVAL2   = fs(14);
+   int F_BODY    = fs(8);
+   int F_VAL     = fs(9);
+   int F_BTN     = fs(9);
 
-   // ── Khoảng cách dọc (gaps) ────────────────────────────────
-   int G_LBL    = sz(12);   // chiều cao chữ section label
-   int G_EMA    = sz(10);   // gap từ card metric xuống section EMA
-   int G_AFT    = sz(11);   // gap sau card EMA
-   int G_SLC    = sz(8);    // gap trong SL section
-   int G_CD     = sz(6);    // gap sau SL đến countdown
-   int G_BT     = sz(6);    // gap sau countdown đến batch
-   int G_LOG    = sz(8);    // gap sau batch đến log
-   int G_FT     = sz(12);   // gap sau log đến footer
-   int AY_      = sz(38);   // khoảng cách header → section "OVERVIEW"
+   // Card width: 4 cột, gap giữa, margin 2 bên
+   // Tổng: 4*CRD_W + 3*CARD_GAP + 2*MH/2 = PW_
+   int cg_       = sz(CARD_GAP);
+   int CRD_W     = (PW_ - MH - cg_*3) / 4;   // chia 4 đều
 
-   // ── Chiều cao tổng (tự tính, thêm section nào thì cộng vào) ─
-   int totH = HDR_H + AY_ + G_LBL + CRD_H
-            + G_EMA + G_LBL + EMA_CARD
-            + G_AFT + G_LBL + SL_H
-            + G_SLC + CD_H
-            + G_CD  + BT_H
-            + G_BT  + G_LBL + InpMaxLog*RLOG_ + sz(8)
-            + G_FT  + FT_H;
+   // ════════════════════════════════════════════════════════════
+   //  TÍNH TỔNG CHIỀU CAO (từ trên xuống, đúng thứ tự vẽ)
+   //
+   //  py
+   //  + HDR_H              header
+   //  + G_HDR_OV           gap header → Overview label
+   //  + G_LBL              Overview label
+   //  + CRD_H              4 cards
+   //  + G_CRD_EMA          gap cards → EMA label
+   //  + G_LBL              EMA label
+   //  + EMA_CARD           card EMA đầy đủ
+   //  + G_EMA_SL           gap EMA → SL label
+   //  + G_LBL              SL label
+   //  + SL_H               2 cards SL/Close
+   //  + G_SLC              gap SL → countdown
+   //  + CD_H               countdown bar
+   //  + G_CD_BT            gap countdown → batch
+   //  + BT_H               batch bar
+   //  + G_BT_LOG           gap batch → log label
+   //  + G_LBL              log label
+   //  + InpMaxLog*RLOG_+sz(8)  log area
+   //  + G_LOG_FT           gap log → footer
+   //  + FT_H               footer
+   // ════════════════════════════════════════════════════════════
+   int totH = HDR_H + G_HDR_OV + G_LBL + CRD_H
+            + G_CRD_EMA + G_LBL + EMA_CARD
+            + G_EMA_SL  + G_LBL + SL_H
+            + G_SLC + CD_H + G_CD_BT + BT_H
+            + G_BT_LOG + G_LBL + InpMaxLog*RLOG_ + sz(8)
+            + G_LOG_FT + FT_H;
 
-   // ── Background shadow + main panel ───────────────────────
-   Rect("d_sh", px+3,py+3, PW_,totH, C'6,8,14',C'6,8,14',0);
-   Rect("d_bg", px,  py,   PW_,totH, C_BG, C_BDR2, 1);
+   // Shadow + background
+   Rect("d_sh", px+3, py+3, PW_, totH, C'6,8,14', C'6,8,14', 0);
+   Rect("d_bg", px,   py,   PW_, totH, C_BG, C_BDR2, 1);
 
    // ════════════════════════════════════════════════════════════
    //  HEADER
+   //  Layout (trái → phải):
+   //  [title] | [symbol]   [status]   [S][M][L][XL]  [X]
    // ════════════════════════════════════════════════════════════
-   Rect("d_hdr_bg",   px,py,   PW_,HDR_H, C_HDR,C_BDR2,0);
-   Rect("d_hdr_line", px,py,   PW_,2,     C_GOLD,C_GOLD,0);
-   Lbl("d_hdr_title", px+sz(12), py+sz(11), "Auto tracking", C_GOLD,  F_HDR, true);
-   Lbl("d_hdr_pipe",  px+sz(100),py+sz(12), "|",             C_MUTED2,F_BODY);
-   Lbl("d_hdr_sym",   px+sz(110),py+sz(11), gSym,            C_WHITE, F_HDR, true);
-   Lbl("d_hdr_status",px+(PW_/2-sz(36)),py+sz(11),"[RUNNING]",C_GREEN,F_VAL,true);
-   Btn("d_btn_hide",  px+PW_-sz(56),py+sz(6), sz(50),sz(22),"[ X ]",C_CARD,C_CYAN,F_BTN);
+   Rect("d_hdr_bg",   px,py,       PW_,HDR_H, C_HDR,  C_BDR2, 0);
+   Rect("d_hdr_line", px,py,       PW_,2,     C_GOLD, C_GOLD, 0);
+   Lbl("d_hdr_title", px+MH+sz(4), py+sz(11), "Auto tracking",  C_GOLD,  F_HDR, true);
+   Lbl("d_hdr_pipe",  px+sz(100),  py+sz(12), "|",              C_MUTED2,F_BODY);
+   Lbl("d_hdr_sym",   px+sz(110),  py+sz(11), gSym,             C_WHITE, F_HDR, true);
+   Lbl("d_hdr_status",px+PW_/2-sz(36), py+sz(11), "[RUNNING]",  C_GREEN, F_VAL, true);
+
+   // --- Scale buttons: 4 nút [ S ][ M ][ L ][ XL ] ---
+   // Đặt sát bên trái nút [ X ], mỗi nút rộng 22px (base), cao 20px, gap 3px
+   int scBtnW  = sz(22);   // chiều rộng mỗi nút scale
+   int scBtnH  = sz(20);   // chiều cao nút scale
+   int scBtnGp = sz(3);    // gap giữa các nút
+   int scBtnY  = py + (HDR_H - scBtnH) / 2;   // canh giữa theo chiều cao header
+   int hideW   = sz(50);   // chiều rộng nút [ X ]
+   int hideGap = sz(4);    // gap giữa nhóm scale và nút X
+
+   // Nút [ X ] — giữ nguyên, chỉ tính lại X để nhường chỗ scale buttons
+   int hideX = px + PW_ - hideW - sz(4);
+   Btn("d_btn_hide", hideX, scBtnY, hideW, scBtnH, "[ X ]", C_CARD, C_CYAN, F_BTN);
+
+   // Nhóm 4 nút scale — nằm sát bên trái nút X
+   // Thứ tự phải → trái: XL, L, M, S
+   string scIds[4]   = {"d_btn_sc_xl","d_btn_sc_l","d_btn_sc_m","d_btn_sc_s"};
+   string scLabels[4]= {"XL","L","M","S"};
+   int    scVals[4]  = {150,120,100,80};
+
+   for(int i=0;i<4;i++)
+   {
+      int bx = hideX - hideGap - (i+1)*(scBtnW+scBtnGp) + scBtnGp;
+      // Nút active (scale hiện tại) highlight vàng
+      bool isActive = (scVals[i] == gDashScale);
+      color btnBg  = isActive ? C'30,38,56' : C_CARD;
+      color btnClr = isActive ? C_GOLD      : C_MUTED;
+      Btn(scIds[i], bx, scBtnY, scBtnW, scBtnH, scLabels[i], btnBg, btnClr, F_BTN);
+      // Active indicator: đường vàng dưới nút
+      if(isActive)
+         Rect(scIds[i]+"_act", bx, scBtnY+scBtnH-2, scBtnW, 2, C_GOLD, C_GOLD, 0);
+   }
+
+   // Label nhỏ "SIZE" phía bên trái nhóm nút
+   int scLblX = hideX - hideGap - 4*(scBtnW+scBtnGp) + scBtnGp - sz(26);
+   Lbl("d_hdr_sizelbl", scLblX, py+sz(12), "SIZE:", C_MUTED2, F_BODY);
 
    // ════════════════════════════════════════════════════════════
    //  SECTION A: 4 METRIC CARDS
    // ════════════════════════════════════════════════════════════
-   int ay  = py + HDR_H + AY_;    // Y label "OVERVIEW"
-   int cy_ = ay + G_LBL;          // Y bắt đầu 4 card
-   int cg_ = sz(6);               // gap giữa card
+   int ay  = py + HDR_H + G_HDR_OV;    // Y label "OVERVIEW"
+   int cy_ = ay + G_LBL;               // Y bắt đầu 4 card
 
-   // Vẽ 4 card — X tự tính theo chỉ số i
    color cardAccent[4] = {C_BLUE, C_GREEN, C_CYAN, C_PURPLE};
    string cardId[4]    = {"c1","c2","c3","c4"};
    string cardLbl[4]   = {"POSITIONS","TOTAL P&L","SL SET","BREAKEVEN"};
    string cardVal[4]   = {"0","+0.00","0","0"};
    string cardSub[4]   = {"lenh mo","USD","lenh OK","locked"};
    color  cardVc[4]    = {C_WHITE, C_GREEN, C_CYAN, C_PURPLE};
-   int    cardFs[4]    = {F_CVAL, F_CVAL2, F_CVAL, F_CVAL};  // P&L hơi nhỏ hơn
+   int    cardFs[4]    = {F_CVAL, F_CVAL2, F_CVAL, F_CVAL};
 
-   Lbl("d_s_ov", px+sz(10), ay, "OVERVIEW", C_MUTED, F_SECT);
+   Lbl("d_s_ov", px+MH+sz(2), ay, "OVERVIEW", C_MUTED, F_SECT);
 
    for(int i=0;i<4;i++)
    {
-      int cx_i = px+sz(5)+(CRD_W+cg_)*i;
-      Rect("d_"+cardId[i],    cx_i, cy_, CRD_W, CRD_H, C_CARD,          C_BDR);
-      Rect("d_"+cardId[i]+"t",cx_i, cy_, CRD_W, 2,     cardAccent[i],   cardAccent[i],0);
-      Lbl("d_"+cardId[i]+"l", cx_i+sz(6), cy_+sz(9),           cardLbl[i], C_MUTED,    F_CLBL);
-      Lbl("d_"+cardId[i]+"v", cx_i+sz(6), cy_+sz(21),          cardVal[i], cardVc[i],  cardFs[i], true);
-      Lbl("d_"+cardId[i]+"s", cx_i+sz(6), cy_+CRD_H-sz(12),    cardSub[i], C_MUTED,    F_CLBL);
+      int cx_i = px + MH/2 + (CRD_W + cg_)*i;
+      Rect("d_"+cardId[i],    cx_i, cy_, CRD_W, CRD_H, C_CARD,        C_BDR);
+      Rect("d_"+cardId[i]+"t",cx_i, cy_, CRD_W, 2,     cardAccent[i], cardAccent[i],0);
+      Lbl("d_"+cardId[i]+"l", cx_i+sz(6), cy_+sz(9),        cardLbl[i], C_MUTED,   F_CLBL);
+      Lbl("d_"+cardId[i]+"v", cx_i+sz(6), cy_+sz(21),       cardVal[i], cardVc[i], cardFs[i], true);
+      Lbl("d_"+cardId[i]+"s", cx_i+sz(6), cy_+CRD_H-sz(12), cardSub[i], C_MUTED,  F_CLBL);
    }
 
    // ════════════════════════════════════════════════════════════
    //  SECTION B: EMA CHART CARD
+   //  Lưu ý: các Y ở đây PHẢI khớp với CalcCanvasScreenY()
    // ════════════════════════════════════════════════════════════
-   int by  = cy_ + CRD_H + G_EMA;    // Y label "EMA ANALYSIS"
-   int eby = by + G_LBL;              // Y outer card EMA
+   int by  = cy_ + CRD_H + G_CRD_EMA;  // Y label "EMA ANALYSIS"
+   int eby = by  + G_LBL;              // Y outer card EMA
 
-   Lbl("d_s_ema", px+sz(10), by,
+   Lbl("d_s_ema", px+MH+sz(2), by,
        StringFormat("EMA ANALYSIS  —  M5  ( %d / %d / %d )",gEmaFast,gEmaMid,gEmaSlow),
        C_MUTED, F_SECT);
 
    // Outer card
-   Rect("d_ema_bg",  px+sz(5), eby, PW_-sz(10), EMA_CARD, C_CARD, C_BDR);
-   Rect("d_ema_top", px+sz(5), eby, PW_-sz(10), EMA_ACC,  C_GOLD2, C_GOLD2, 0);
+   int ema_inner_w = PW_ - MH;           // PW_ - 2*MH/2 (trái+phải)
+   Rect("d_ema_bg",  px+MH/2, eby, ema_inner_w, EMA_CARD, C_CARD, C_BDR);
+   Rect("d_ema_top", px+MH/2, eby, ema_inner_w, EMA_ACC,  C_GOLD2,C_GOLD2,0);
 
    // Sub-header
    int esh_y = eby + EMA_ACC;
-   Rect("d_ema_sh", px+sz(5), esh_y, PW_-sz(10), EMA_SH, C_CARD2, C_BDR, 0);
-   Lbl("d_ema_shl", px+sz(12), esh_y+sz(8),
+   Rect("d_ema_sh", px+MH/2, esh_y, ema_inner_w, EMA_SH, C_CARD2, C_BDR, 0);
+   Lbl("d_ema_shl", px+MH+sz(4), esh_y+sz(8),
        StringFormat("M5  %d / %d / %d",gEmaFast,gEmaMid,gEmaSlow), C_MUTED, F_BODY);
-   // Legend dots (3 chấm màu F/M/S)
-   int ldx = px+sz(115);
-   Rect("d_leg_f", ldx,       esh_y+sz(9), sz(6),sz(6), C_YELLOW,C_YELLOW,0);
-   Rect("d_leg_m", ldx+sz(22),esh_y+sz(9), sz(6),sz(6), C_CYAN,  C_CYAN,  0);
-   Rect("d_leg_s", ldx+sz(44),esh_y+sz(9), sz(6),sz(6), C_ORANGE,C_ORANGE,0);
-   Lbl("d_leg_fl",  ldx+sz(8), esh_y+sz(8), "F", C_YELLOW,F_BODY,true);
-   Lbl("d_leg_ml",  ldx+sz(30),esh_y+sz(8), "M", C_CYAN,  F_BODY,true);
-   Lbl("d_leg_sl",  ldx+sz(52),esh_y+sz(8), "S", C_ORANGE,F_BODY,true);
-   // Trend badge
-   Lbl("d_ema_shbdg", px+PW_-sz(160), esh_y+sz(8), "ANALYZING...", C_ORANGE, F_VAL, true);
 
-   // Viền canvas (canvas bitmap nằm bên trong, khớp với CalcCanvasScreenY)
-   int ecv_y = esh_y + EMA_SH;
-   Rect("d_ema_cvbrd", px+sz(7), ecv_y, CW_+sz(2), EMA_CV+sz(2), C'5,9,17', C_BDR2, 1);
+   // Legend dots
+   int ldx = px + sz(115);
+   Rect("d_leg_f", ldx,        esh_y+sz(9), sz(6),sz(6), C_YELLOW,C_YELLOW,0);
+   Rect("d_leg_m", ldx+sz(22), esh_y+sz(9), sz(6),sz(6), C_CYAN,  C_CYAN,  0);
+   Rect("d_leg_s", ldx+sz(44), esh_y+sz(9), sz(6),sz(6), C_ORANGE,C_ORANGE,0);
+   Lbl("d_leg_fl",  ldx+sz(8),  esh_y+sz(8), "F", C_YELLOW,F_BODY,true);
+   Lbl("d_leg_ml",  ldx+sz(30), esh_y+sz(8), "M", C_CYAN,  F_BODY,true);
+   Lbl("d_leg_sl",  ldx+sz(52), esh_y+sz(8), "S", C_ORANGE,F_BODY,true);
+
+   // Trend badge — căn phải, cách mép sz(12)
+   Lbl("d_ema_shbdg", px+PW_-sz(120), esh_y+sz(8), "ANALYZING...", C_ORANGE, F_VAL, true);
+
+   // Viền canvas: đặt tại cùng X, Y với InitCanvas, +1px mỗi bên
+   int ecv_y = esh_y + EMA_SH;   // ← đây là ecv_y, khớp CalcCanvasScreenY()
+   int cvBrdX = px + sz(MARGIN_H) - 1;
+   int cvBrdW = CanvasW() + 2;
+   Rect("d_ema_cvbrd", cvBrdX, ecv_y, cvBrdW, EMA_CV+2, C'5,9,17', C_BDR2, 1);
 
    // Controls +/- EMA periods
-   int cty = ecv_y + EMA_CV + sz(4);   // Y row controls
-   Rect("d_ema_ctrl", px+sz(5), cty, PW_-sz(10), EMA_CTRL, C_CARD2, C_BDR, 0);
+   int cty = ecv_y + EMA_CV + sz(4);
+   Rect("d_ema_ctrl", px+MH/2, cty, ema_inner_w, EMA_CTRL, C_CARD2, C_BDR, 0);
 
-   // 3 groups (Fast / Mid / Slow) chia đều 3/4 chiều ngang, 1/4 bên phải cho SCORE
-   int grpW = (PW_ - sz(120)) / 3;   // chiều rộng mỗi group
+   // 3 groups chia đều trong ema_inner_w trừ vùng SCORE sz(90) bên phải
+   int scoreW   = sz(90);
+   int grpsW    = ema_inner_w - scoreW;
+   int grpW     = grpsW / 3;
    string grpId[3]  = {"f","m","s"};
    color  grpClr[3] = {C_YELLOW, C_CYAN, C_ORANGE};
    int    grpVal[3] = {gEmaFast, gEmaMid, gEmaSlow};
    string grpLbl[3] = {"F:","M:","S:"};
+
+   int btnW = sz(17), btnH = sz(16);
    for(int i=0;i<3;i++)
    {
-      int gx = px + sz(14) + grpW*i;
-      int btnW = sz(17), btnH = sz(16);
-      Rect("d_ema_"+grpId[i]+"_dot", gx,       cty+sz(9), sz(7),sz(7), grpClr[i],grpClr[i],0);
-      Lbl("d_ema_"+grpId[i]+"l2",    gx+sz(10),cty+sz(6), grpLbl[i],    C_MUTED,  F_BODY);
-      Lbl("d_ema_"+grpId[i]+"val",   gx+sz(26),cty+sz(5), (string)grpVal[i], grpClr[i], F_VAL, true);
-      Btn("d_btn_"+grpId[i]+"_dec",  gx+sz(58),cty+sz(5), btnW,btnH, "-", C_CARD, C_RED,   F_BTN);
-      Btn("d_btn_"+grpId[i]+"_inc",  gx+sz(77),cty+sz(5), btnW,btnH, "+", C_CARD, C_GREEN, F_BTN);
+      int gx = px + MH/2 + sz(6) + grpW*i;
+      int gvy = cty + (EMA_CTRL - btnH) / 2;  // vertically centred in ctrl bar
+
+      Rect("d_ema_"+grpId[i]+"_dot", gx,       cty+sz(9), sz(7),sz(7),   grpClr[i],grpClr[i],0);
+      Lbl("d_ema_"+grpId[i]+"l2",    gx+sz(10), cty+sz(6), grpLbl[i],    C_MUTED,  F_BODY);
+      Lbl("d_ema_"+grpId[i]+"val",   gx+sz(28), cty+sz(5), (string)grpVal[i], grpClr[i], F_VAL, true);
+      Btn("d_btn_"+grpId[i]+"_dec",  gx+sz(58), gvy,       btnW,btnH, "-", C_CARD, C_RED,   F_BTN);
+      Btn("d_btn_"+grpId[i]+"_inc",  gx+sz(78), gvy,       btnW,btnH, "+", C_CARD, C_GREEN, F_BTN);
    }
-   Lbl("d_ema_sc_l",   px+PW_-sz(76), cty+sz(6), "SCORE:", C_MUTED,  F_BODY);
-   Lbl("d_ema_score_v",px+PW_-sz(36), cty+sz(5), "50",     C_ORANGE, F_VAL, true);
 
-   // Signal row (TREND | SIGNAL | STRENGTH)
+   // SCORE — căn phải trong ctrl bar
+   int scX = px + MH/2 + ema_inner_w - scoreW + sz(4);
+   Lbl("d_ema_sc_l",    scX,        cty+sz(6), "SCORE:", C_MUTED,  F_BODY);
+   Lbl("d_ema_score_v", scX+sz(46), cty+sz(5), "50",     C_ORANGE, F_VAL, true);
+
+   // Signal row
    int sry = cty + EMA_CTRL + sz(4);
-   Rect("d_ema_sig_bg", px+sz(5), sry, PW_-sz(10), EMA_SIG, C_CARD2, C_BDR, 0);
-   int colW = (PW_ - sz(10)) / 3;   // chia 3 cột đều
-   int col0 = px+sz(14), col1 = px+sz(5)+colW, col2 = px+sz(5)+colW*2;
-   Lbl("d_ema_trl", col0,        sry+sz(5), "TREND:",    C_MUTED,  F_BODY);
-   Lbl("d_ema_trv", col0+sz(54), sry+sz(4), "---",       C_ORANGE, F_VAL,  true);
-   Rect("d_sig_s1", col1-sz(8),  sry+sz(4), 1,sz(14),    C_MUTED2, C_MUTED2, 0);
-   Lbl("d_ema_sgl", col1,        sry+sz(5), "SIGNAL:",   C_MUTED,  F_BODY);
-   Lbl("d_ema_sgv", col1+sz(64), sry+sz(4), "WAIT",      C_ORANGE, F_VAL,  true);
-   Rect("d_sig_s2", col2-sz(8),  sry+sz(4), 1,sz(14),    C_MUTED2, C_MUTED2, 0);
-   Lbl("d_ema_stl", col2,        sry+sz(5), "STRENGTH:", C_MUTED,  F_BODY);
-   Lbl("d_ema_stv", col2+sz(90), sry+sz(4), "---",       C_MUTED,  F_VAL,  true);
+   Rect("d_ema_sig_bg", px+MH/2, sry, ema_inner_w, EMA_SIG, C_CARD2, C_BDR, 0);
 
-   // Reason line + score bar
+   // 3 cột đều trong ema_inner_w
+   int sigColW = ema_inner_w / 3;
+   int col0    = px + MH/2 + sz(6);
+   int col1    = px + MH/2 + sigColW;
+   int col2    = px + MH/2 + sigColW*2;
+
+   Lbl("d_ema_trl",  col0,        sry+sz(5), "TREND:",    C_MUTED,  F_BODY);
+   Lbl("d_ema_trv",  col0+sz(54), sry+sz(4), "---",       C_ORANGE, F_VAL,  true);
+
+   Rect("d_sig_s1",  col1-sz(6),  sry+sz(4), 1,sz(14),   C_MUTED2, C_MUTED2, 0);
+   Lbl("d_ema_sgl",  col1+sz(4),  sry+sz(5), "SIGNAL:",   C_MUTED,  F_BODY);
+   Lbl("d_ema_sgv",  col1+sz(62), sry+sz(4), "WAIT",      C_ORANGE, F_VAL,  true);
+
+   Rect("d_sig_s2",  col2-sz(6),  sry+sz(4), 1,sz(14),   C_MUTED2, C_MUTED2, 0);
+   Lbl("d_ema_stl",  col2+sz(4),  sry+sz(5), "STRENGTH:", C_MUTED,  F_BODY);
+   Lbl("d_ema_stv",  col2+sz(78), sry+sz(4), "---",       C_MUTED,  F_VAL,  true);
+
+   // Reason line
    int rsy = sry + EMA_SIG;
-   Lbl("d_ema_rsn", px+sz(12), rsy, "...", C_MUTED, F_BODY);
+   Lbl("d_ema_rsn", px+MH+sz(4), rsy+sz(2), "...", C_MUTED, F_BODY);
 
-   int sbY = eby + EMA_CARD - EMA_SB - sz(3);  // sát đáy card
-   Rect("d_sbar_bg",   px+sz(5), sbY, PW_-sz(10), EMA_SB, C_CARD2,C_CARD2, 0);
-   Rect("d_sbar_fill", px+sz(5), sbY, 0,          EMA_SB, C_GREEN,C_GREEN, 0);
+   // Score bar — sát đáy card EMA
+   int sbY = eby + EMA_CARD - EMA_SB - sz(2);
+   Rect("d_sbar_bg",   px+MH/2, sbY, ema_inner_w, EMA_SB, C_CARD2,C_CARD2, 0);
+   Rect("d_sbar_fill", px+MH/2, sbY, 0,           EMA_SB, C_GREEN,C_GREEN, 0);
 
    // ════════════════════════════════════════════════════════════
    //  SECTION C: STOP LOSS  &  AUTO CLOSE
    // ════════════════════════════════════════════════════════════
-   int ccY  = eby + EMA_CARD + G_AFT;   // Y label section SL
-   int ccyy = ccY + G_LBL;              // Y bắt đầu 2 card SL/Close
-   int hw   = (PW_ - sz(15)) / 2;       // chiều rộng mỗi card (chia đôi)
+   int ccY  = eby + EMA_CARD + G_EMA_SL;   // Y label section
+   int ccyy = ccY + G_LBL;                 // Y bắt đầu 2 card
 
-   Lbl("d_s_sl", px+sz(10), ccY, "STOP LOSS  &  CLOSE", C_MUTED, F_SECT);
+   // Chia 2 card đều, cùng gap ở giữa như cg_
+   int hw  = (PW_ - MH - cg_) / 2;
+
+   Lbl("d_s_sl", px+MH+sz(2), ccY, "STOP LOSS  &  CLOSE", C_MUTED, F_SECT);
 
    // Card SL (trái)
-   Rect("d_sl_c", px+sz(5),      ccyy, hw, SL_H, C_CARD, C_BDR);
-   Rect("d_sl_t", px+sz(5),      ccyy, hw, 2,    C_CYAN, C_CYAN, 0);
-   Lbl("d_sl_hd", px+sz(11),     ccyy+sz(9),         "STOP LOSS H1",  C_CYAN,  F_VAL,  true);
-   Lbl("d_sl_bl", px+sz(11),     ccyy+SL_H*28/100,   "BUY SL:",       C_MUTED, F_BODY);
-   Lbl("d_sl_bv", px+sz(11)+sz(68), ccyy+SL_H*28/100,"---",           C_BLUE,  F_VAL,  true);
-   Lbl("d_sl_sl", px+sz(11),     ccyy+SL_H*50/100,   "SELL SL:",      C_MUTED, F_BODY);
-   Lbl("d_sl_sv", px+sz(11)+sz(68), ccyy+SL_H*50/100,"---",           C_RED,   F_VAL,  true);
-   Lbl("d_sl_st", px+sz(11),     ccyy+SL_H*72/100,   "0 OK / 0 FAIL", C_GREEN, F_BODY);
-   Lbl("d_sl_rt", px+sz(11),     ccyy+SL_H*86/100,   "",              C_MUTED, F_BODY);
+   int slX = px + MH/2;
+   Rect("d_sl_c", slX, ccyy, hw, SL_H, C_CARD, C_BDR);
+   Rect("d_sl_t", slX, ccyy, hw, 2,    C_CYAN, C_CYAN, 0);
+   Lbl("d_sl_hd", slX+sz(6), ccyy+sz(9),            "STOP LOSS H1",   C_CYAN,  F_VAL,  true);
+   Lbl("d_sl_bl", slX+sz(6), ccyy+SL_H*28/100,      "BUY SL:",        C_MUTED, F_BODY);
+   Lbl("d_sl_bv", slX+sz(6)+sz(68), ccyy+SL_H*28/100,"---",           C_BLUE,  F_VAL,  true);
+   Lbl("d_sl_sl", slX+sz(6), ccyy+SL_H*50/100,      "SELL SL:",       C_MUTED, F_BODY);
+   Lbl("d_sl_sv", slX+sz(6)+sz(68), ccyy+SL_H*50/100,"---",           C_RED,   F_VAL,  true);
+   Lbl("d_sl_st", slX+sz(6), ccyy+SL_H*72/100,      "0 OK / 0 FAIL",  C_GREEN, F_BODY);
+   Lbl("d_sl_rt", slX+sz(6), ccyy+SL_H*86/100,      "",               C_MUTED, F_BODY);
 
    // Card AutoClose (phải)
-   int clx = px+sz(5)+hw+sz(5);
+   int clx = slX + hw + cg_;
    Rect("d_cl_c", clx, ccyy, hw, SL_H, C_CARD, C_BDR);
    Rect("d_cl_t", clx, ccyy, hw, 2,    C_YELLOW, C_YELLOW, 0);
-   Lbl("d_cl_hd", clx+sz(6), ccyy+sz(9),          "AUTO CLOSE",     C_YELLOW,F_VAL,  true);
-   Lbl("d_cl_ml", clx+sz(6), ccyy+SL_H*28/100,    "Phut dong:",     C_MUTED, F_BODY);
+   Lbl("d_cl_hd", clx+sz(6), ccyy+sz(9),           "AUTO CLOSE",     C_YELLOW,F_VAL,  true);
+   Lbl("d_cl_ml", clx+sz(6), ccyy+SL_H*28/100,     "Phut dong:",     C_MUTED, F_BODY);
    Lbl("d_cl_mv", clx+sz(6)+sz(80), ccyy+SL_H*28/100,
        InpAutoClose?StringFormat(":%02d",InpCloseMinute):"OFF",
        InpAutoClose?C_YELLOW:C_MUTED, F_VAL, true);
-   Lbl("d_cl_cdl",clx+sz(6), ccyy+SL_H*50/100,    "Countdown:",     C_MUTED, F_BODY);
-   Lbl("d_cl_cdv",clx+sz(6)+sz(80),ccyy+SL_H*50/100,"--",           C_CYAN,  F_VAL,  true);
-   Lbl("d_cl_st", clx+sz(6), ccyy+SL_H*72/100,    "0 OK / 0 FAIL",  C_GREEN, F_BODY);
+   Lbl("d_cl_cdl",clx+sz(6), ccyy+SL_H*50/100,     "Countdown:",     C_MUTED, F_BODY);
+   Lbl("d_cl_cdv",clx+sz(6)+sz(80),ccyy+SL_H*50/100,"--",            C_CYAN,  F_VAL,  true);
+   Lbl("d_cl_st", clx+sz(6), ccyy+SL_H*72/100,     "0 OK / 0 FAIL",  C_GREEN, F_BODY);
    Lbl("d_cl_be", clx+sz(6), ccyy+SL_H*86/100,
        InpBEEnabled?StringFormat("BE: $%.0f >> +$%.0f",InpBETrigger,InpBELock):"BE: OFF",
        InpBEEnabled?C_PURPLE:C_MUTED, F_BODY);
@@ -888,50 +1076,61 @@ void BuildPanel()
    //  SECTION D: COUNTDOWN BAR
    // ════════════════════════════════════════════════════════════
    int dy = ccyy + SL_H + G_SLC;
-   Rect("d_cd_c",   px+sz(5), dy, PW_-sz(10), CD_H, C_CARD2,C_BDR);
-   Lbl("d_cd_lbl",  px+sz(12), dy+sz(6),       "CLOSE TIMER:", C_MUTED, F_BODY);
-   int cdbarX = px+sz(105), cdbarW = PW_-sz(117);
-   Rect("d_cd_bg",  cdbarX, dy+sz(7), cdbarW, sz(8), C'14,20,34',C_BDR);
-   Rect("d_cd_fill",cdbarX, dy+sz(7), 0,      sz(8), C_GREEN,C_GREEN,0);
-   Lbl("d_cd_txt",  cdbarX+sz(4), dy+sz(6), "-- phut nua", C_WHITE, F_BODY, true);
+
+   // Progress bar: bắt đầu sau label "CLOSE TIMER:", kết thúc cách mép phải sz(6)
+   int cdLblW   = sz(105);                          // ước lượng chiều rộng chữ label
+   int cdbarX   = px + MH/2 + cdLblW;
+   int cdbarW   = PW_ - MH - cdLblW - sz(6);       // tự scale: không hardcode
+   int cdbarH   = sz(8);
+   int cdbarY   = dy + (CD_H - cdbarH) / 2;
+
+   Rect("d_cd_c",    px+MH/2, dy,     PW_-MH,  CD_H, C_CARD2,C_BDR);
+   Lbl("d_cd_lbl",   px+MH+sz(4), dy+sz(6), "CLOSE TIMER:", C_MUTED, F_BODY);
+   Rect("d_cd_bg",   cdbarX, cdbarY, cdbarW,  cdbarH, C'14,20,34',C_BDR);
+   Rect("d_cd_fill", cdbarX, cdbarY, 0,       cdbarH, C_GREEN,C_GREEN,0);
+   Lbl("d_cd_txt",   cdbarX+sz(4), dy+sz(6), "-- phut nua", C_WHITE, F_BODY, true);
 
    // ════════════════════════════════════════════════════════════
    //  SECTION E: BATCH STATUS BAR
    // ════════════════════════════════════════════════════════════
-   int ey = dy + CD_H + G_CD;
-   Rect("d_bt_bg",px+sz(5), ey, PW_-sz(10), BT_H, C_CARD2,C_BDR);
-   Lbl("d_bt_l",  px+sz(12),ey+sz(5), "BATCH:",   C_MUTED, F_BODY);
-   Lbl("d_bt_v",  px+sz(54),ey+sz(5), "STANDBY",  C_GREEN, F_BODY, true);
-   Lbl("d_bt_s1", px+sz(118),ey+sz(5),"|",         C_MUTED2,F_BODY);
-   Lbl("d_bt_be", px+sz(126),ey+sz(5),
+   int ey = dy + CD_H + G_CD_BT;
+   Rect("d_bt_bg", px+MH/2, ey, PW_-MH, BT_H, C_CARD2,C_BDR);
+   Lbl("d_bt_l",   px+MH+sz(4), ey+sz(5), "BATCH:",    C_MUTED, F_BODY);
+   Lbl("d_bt_v",   px+MH+sz(50),ey+sz(5), "STANDBY",   C_GREEN, F_BODY, true);
+
+   // Separator + BE info: không hardcode số tuyệt đối, dùng PW_ fraction
+   int sep1x = px + MH/2 + PW_/4;
+   int sep2x = px + MH/2 + PW_*3/4;
+   Lbl("d_bt_s1", sep1x,       ey+sz(5), "|",         C_MUTED2,F_BODY);
+   Lbl("d_bt_be", sep1x+sz(8), ey+sz(5),
        InpBEEnabled?StringFormat("BE $%.0f>>+$%.0f",InpBETrigger,InpBELock):"BE:OFF",
        InpBEEnabled?C_PURPLE:C_MUTED, F_BODY);
-   Lbl("d_bt_s2", px+PW_-sz(230),ey+sz(5),"|",     C_MUTED2,F_BODY);
-   Lbl("d_bt_rt", px+PW_-sz(220),ey+sz(5),
+   Lbl("d_bt_s2", sep2x,        ey+sz(5), "|",         C_MUTED2,F_BODY);
+   Lbl("d_bt_rt", sep2x+sz(8),  ey+sz(5),
        StringFormat("Retry %dx%dms | Delay %dms",InpRetryCount,InpRetryDelay,InpBatchDelay),
        C_MUTED, F_BODY);
 
    // ════════════════════════════════════════════════════════════
    //  SECTION F: LOG
    // ════════════════════════════════════════════════════════════
-   int fy  = ey + BT_H + G_BT;
+   int fy  = ey + BT_H + G_BT_LOG;
    int lgy = fy + G_LBL;
-   Lbl("d_log_l", px+sz(10), fy, "JOURNAL", C_MUTED, F_SECT);
-   Rect("d_log_bg",px+sz(5), lgy, PW_-sz(10), InpMaxLog*RLOG_+sz(8), C'8,12,20',C_BDR);
+   Lbl("d_log_l",  px+MH+sz(2), fy, "JOURNAL", C_MUTED, F_SECT);
+   Rect("d_log_bg",px+MH/2, lgy, PW_-MH, InpMaxLog*RLOG_+sz(8), C'8,12,20',C_BDR);
    for(int i=0;i<InpMaxLog;i++)
-      Lbl(StringFormat("d_log%d",i), px+sz(11), lgy+sz(4)+i*RLOG_, "", C_MUTED, F_BODY);
+      Lbl(StringFormat("d_log%d",i), px+MH+sz(4), lgy+sz(4)+i*RLOG_, "", C_MUTED, F_BODY);
 
    // ════════════════════════════════════════════════════════════
    //  FOOTER
    // ════════════════════════════════════════════════════════════
-   int ffY = lgy + InpMaxLog*RLOG_ + sz(8) + G_FT;
+   int ffY = lgy + InpMaxLog*RLOG_ + sz(8) + G_LOG_FT;
    Rect("d_ft_bg",  px,ffY, PW_,FT_H, C'10,13,20',C_BDR, 0);
    Rect("d_ft_line",px,ffY, PW_,1,    C_GOLD2,C_GOLD2, 0);
-   Lbl("d_ft_sym",  px+sz(12), ffY+sz(4), gSym,                         C_GOLD,  F_BODY, true);
-   Lbl("d_ft_s1",   px+sz(50), ffY+sz(4), "|",                          C_MUTED2,F_BODY);
-   Lbl("d_ft_time", px+sz(58), ffY+sz(4), "",                           C_MUTED, F_BODY);
-   Lbl("d_ft_s2",   px+PW_-sz(268),ffY+sz(4), "|",                      C_MUTED2,F_BODY);
-   Lbl("d_ft_srv",  px+PW_-sz(258),ffY+sz(4), "copyright by TVH-SMILE", C_MUTED, F_BODY);
+   Lbl("d_ft_sym",  px+MH+sz(4), ffY+sz(4), gSym,                         C_GOLD,  F_BODY, true);
+   Lbl("d_ft_s1",   px+sz(50),   ffY+sz(4), "|",                           C_MUTED2,F_BODY);
+   Lbl("d_ft_time", px+sz(58),   ffY+sz(4), "",                            C_MUTED, F_BODY);
+   Lbl("d_ft_s2",   px+PW_-sz(200),ffY+sz(4), "|",                         C_MUTED2,F_BODY);
+   Lbl("d_ft_srv",  px+PW_-sz(192),ffY+sz(4), "copyright by TVH-SMILE",    C_MUTED, F_BODY);
 
    ChartRedraw(0);
 }
@@ -941,13 +1140,24 @@ void BuildPanel()
 //======================================================================
 void PanelToggle()
 {
+   // Các object trong header luôn hiển thị (kể cả khi hidden)
+   // Tất cả object khác toggle theo gHidden
    for(int i=0;i<ArraySize(gObjs);i++)
    {
       string n=gObjs[i];
-      if(n=="d_bg"||n=="d_sh"||n=="d_hdr_bg"||n=="d_hdr_line"||
-         n=="d_hdr_title"||n=="d_hdr_pipe"||n=="d_hdr_sym"||
-         n=="d_hdr_ver"||n=="d_hdr_status"||n=="d_hdr_clock"||
-         n=="d_btn_hide"||n=="d_btn_hide_bg") continue;
+      // Giữ lại: background, toàn bộ header, các nút scale, nút hide
+      if(n=="d_bg"||n=="d_sh"
+         ||n=="d_hdr_bg"||n=="d_hdr_line"
+         ||n=="d_hdr_title"||n=="d_hdr_pipe"||n=="d_hdr_sym"
+         ||n=="d_hdr_ver"||n=="d_hdr_status"||n=="d_hdr_clock"
+         ||n=="d_hdr_sizelbl"
+         ||n=="d_btn_hide"||n=="d_btn_hide_bg"
+         // Nút scale + active indicator
+         ||n=="d_btn_sc_s"  ||n=="d_btn_sc_s_bg"  ||n=="d_btn_sc_s_act"
+         ||n=="d_btn_sc_m"  ||n=="d_btn_sc_m_bg"  ||n=="d_btn_sc_m_act"
+         ||n=="d_btn_sc_l"  ||n=="d_btn_sc_l_bg"  ||n=="d_btn_sc_l_act"
+         ||n=="d_btn_sc_xl" ||n=="d_btn_sc_xl_bg" ||n=="d_btn_sc_xl_act"
+      ) continue;
       ObjVis(n,!gHidden);
    }
 }
@@ -962,21 +1172,34 @@ void PanelUpdate()
 
    if(gHidden){ ChartRedraw(0); return; }
 
-   int    PW_ = sz(480);
+   int    PW_     = sz(PW_BASE);
+   int    MH      = sz(MARGIN_H);
+   int    cg_     = sz(CARD_GAP);
+
    double h1h=H1High(), h1l=H1Low();
    double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
    int    dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
    double slS=NormalizeDouble(h1h+InpExtraPoints*pt,dg);
    double slB=NormalizeDouble(h1l-InpExtraPoints*pt,dg);
-   int    pc =CntPos();
+   int    pc=CntPos();
    double pnl=TotPnL();
-   int    ml =MnLeft();
-   bool isClose=(dt.min==InpCloseMinute&&InpAutoClose);
-   bool isWarn =(ml<=InpCloseWarning&&ml>0&&InpAutoClose);
+   int    ml=MnLeft();
+   bool   isClose=(dt.min==InpCloseMinute&&InpAutoClose);
+   bool   isWarn =(ml<=InpCloseWarning&&ml>0&&InpAutoClose);
 
    if(gBatchRunning)   { ObjTxt("d_hdr_status","[BUSY]");    ObjClr("d_hdr_status",C_ORANGE); }
    else if(isClose)    { ObjTxt("d_hdr_status","[CLOSING]"); ObjClr("d_hdr_status",C_RED);    }
    else                { ObjTxt("d_hdr_status","[RUNNING]"); ObjClr("d_hdr_status",C_GREEN);  }
+
+   // Cập nhật highlight nút scale theo gDashScale hiện tại
+   string scIds2[4]  = {"d_btn_sc_s","d_btn_sc_m","d_btn_sc_l","d_btn_sc_xl"};
+   int    scVals2[4] = {80,100,120,150};
+   for(int i=0;i<4;i++)
+   {
+      bool active = (scVals2[i] == gDashScale);
+      ObjClr(scIds2[i], active ? C_GOLD : C_MUTED);
+      ObjectSetInteger(0, scIds2[i]+"_bg", OBJPROP_BGCOLOR, active ? C'30,38,56' : C_CARD);
+   }
 
    // Metric cards
    ObjTxt("d_c1v",(string)pc);  ObjClr("d_c1v",pc>0?C_WHITE:C_MUTED);  ObjTxt("d_c1s",pc>0?"lenh mo":"trong");
@@ -999,7 +1222,10 @@ void PanelUpdate()
       ObjClr("d_ema_stv",sig.str=="MANH"?C_GREEN:sig.str=="TRUNG BINH"?C_YELLOW:C_ORANGE);
       ObjTxt("d_ema_rsn",sig.reason);
       ObjTxt("d_ema_score_v",(string)sig.score); ObjClr("d_ema_score_v",sig.tc);
-      ObjW("d_sbar_fill",(int)((PW_-sz(10))*sig.score/100.0));
+
+      // Score bar — chiều rộng tỉ lệ theo ema_inner_w
+      int ema_inner_w = PW_ - MH;
+      ObjW("d_sbar_fill",(int)(ema_inner_w * sig.score / 100.0));
       ObjBg("d_sbar_fill",sig.tc);
    }
 
@@ -1020,20 +1246,21 @@ void PanelUpdate()
    ObjTxt("d_cl_st",StringFormat("%d OK / %d FAIL",statClOk,statClFail));
    ObjClr("d_cl_st",statClFail>0?C_ORANGE:C_GREEN);
 
-   // Countdown bar
-   int cdbarW = PW_ - sz(117);
-   ObjW("d_cd_fill",MathMax(0,MathMin((int)(cdbarW*(1.0-ml/60.0)),cdbarW)));
-   color bc=isClose?C_RED:isWarn?C_ORANGE:C_GREEN;
+   // Countdown bar — cdbarW phải tính giống BuildPanel
+   int cdLblW  = sz(105);
+   int cdbarW  = PW_ - MH - cdLblW - sz(6);
+   ObjW("d_cd_fill", MathMax(0, MathMin((int)(cdbarW*(1.0-ml/60.0)), cdbarW)));
+   color bc = isClose?C_RED:isWarn?C_ORANGE:C_GREEN;
    ObjBg("d_cd_fill",bc);
    int s2c=ml*60-dt.sec; if(s2c<0)s2c=0;
    ObjTxt("d_cd_txt",StringFormat("%02d:%02d den phut :%02d",s2c/60,s2c%60,InpCloseMinute));
    ObjClr("d_cd_txt",bc);
 
    // Batch bar
-   if(gBatchRunning)       { ObjTxt("d_bt_v","PROCESSING..."); ObjClr("d_bt_v",C_ORANGE); }
-   else if(isClose&&pc>0)  { ObjTxt("d_bt_v","CLOSING ALL");   ObjClr("d_bt_v",C_RED);    }
-   else if(isWarn&&pc>0)   { ObjTxt("d_bt_v",StringFormat("WARN -%dmin",ml)); ObjClr("d_bt_v",C_ORANGE); }
-   else                    { ObjTxt("d_bt_v","STANDBY");        ObjClr("d_bt_v",C_GREEN);  }
+   if(gBatchRunning)      { ObjTxt("d_bt_v","PROCESSING..."); ObjClr("d_bt_v",C_ORANGE); }
+   else if(isClose&&pc>0) { ObjTxt("d_bt_v","CLOSING ALL");   ObjClr("d_bt_v",C_RED);    }
+   else if(isWarn&&pc>0)  { ObjTxt("d_bt_v",StringFormat("WARN -%dmin",ml)); ObjClr("d_bt_v",C_ORANGE); }
+   else                   { ObjTxt("d_bt_v","STANDBY");        ObjClr("d_bt_v",C_GREEN);  }
 
    // Log
    int lsz=ArraySize(gLog);
