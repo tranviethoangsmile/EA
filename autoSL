@@ -1,0 +1,1068 @@
+//+------------------------------------------------------------------+
+//|                                        AutoSL_H1_XAUUSD.mq5     |
+//|   AutoSL H1 + EMA M5 Canvas Chart + AutoClose + BE+ | Dash v8   |
+//+------------------------------------------------------------------+
+#property copyright   "Custom EA"
+#property version     "8.00"
+#property strict
+#property description "AutoSL H1 | EMA M5 Visual Canvas | AutoClose | Breakeven+ | Dashboard"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Canvas\Canvas.mqh>
+
+//======================================================================
+//  INPUTS
+//======================================================================
+input string   InpSymbol        = "";
+input double   InpExtraPoints   = 1000.0;
+input bool     InpOnlyBuy       = false;
+input bool     InpOnlySell      = false;
+input bool     InpOverwriteSL   = false;
+input bool     InpAlertOnSet    = true;
+//--- Breakeven
+input bool     InpBEEnabled     = true;
+input double   InpBETrigger     = 10.0;
+input double   InpBELock        = 1.0;
+//--- Auto Close
+input bool     InpAutoClose     = true;
+input int      InpCloseMinute   = 45;
+input int      InpCloseWarning  = 5;
+input bool     InpAlertOnClose  = true;
+//--- EMA M5 (initial, adjustable via panel buttons at runtime)
+input int      InpEMA_Fast      = 8;
+input int      InpEMA_Mid       = 21;
+input int      InpEMA_Slow      = 200;
+//--- System
+input int      InpBatchDelay    = 50;
+input int      InpRetryCount    = 3;
+input int      InpRetryDelay    = 500;
+input int      InpCheckInterval = 1;
+//--- Panel
+input int      InpPanelX        = 12;
+input int      InpPanelY        = 28;
+input int      InpMaxLog        = 5;
+
+//======================================================================
+//  LAYOUT CONSTANTS
+//======================================================================
+#define PW            440
+#define RLOG          13
+#define RROW          17
+
+// EMA Canvas
+#define CANVAS_NAME   "d_ema_canvas"
+#define CANVAS_BARS   55
+#define CANVAS_W      (PW-16)    // 424 px
+#define CANVAS_H      148
+
+// EMA card height = 2(accent)+20(subhdr)+2+CANVAS_H+2+4+22(ctrl)+2+18(sigrow)+2+12(reason)+4(scorebar)+8(pad)
+#define EMA_CARD_H    230
+
+//--- Palette
+#define C_BG        C'12,16,24'
+#define C_HDR       C'16,20,32'
+#define C_CARD      C'20,26,40'
+#define C_CARD2     C'16,20,32'
+#define C_BDR       C'38,52,76'
+#define C_BDR2      C'55,75,108'
+#define C_GOLD      C'212,175,55'
+#define C_GOLD2     C'240,200,80'
+#define C_WHITE     C'215,222,234'
+#define C_MUTED     C'80,100,130'
+#define C_MUTED2    C'55,72,98'
+#define C_GREEN     C'45,198,122'
+#define C_RED       C'226,75,75'
+#define C_ORANGE    C'238,158,40'
+#define C_BLUE      C'60,158,240'
+#define C_CYAN      C'50,195,215'
+#define C_YELLOW    C'235,215,55'
+#define C_PURPLE    C'165,80,225'
+
+//======================================================================
+//  GLOBALS
+//======================================================================
+CTrade        trade;
+CPositionInfo posInfo;
+CCanvas       gEmaCanvas;
+
+string        gSym          = "";
+bool          gHidden       = false;
+bool          gBatchRunning = false;
+bool          gCloseTrig    = false;
+int           gLastCloseMn  = -1;
+int           gLastWarnMn   = -1;
+bool          gCanvasReady  = false;
+datetime      gLastM5Bar    = 0;
+
+//--- Runtime-adjustable EMA periods
+int           gEmaFast, gEmaMid, gEmaSlow;
+
+//--- Stats
+int  statSLOk   = 0, statSLFail  = 0;
+int  statBEOk   = 0;
+int  statClOk   = 0, statClFail  = 0;
+
+//--- Ticket registries
+ulong tickSL[];
+ulong tickBE[];
+ulong tickCL[];
+
+//--- Log ring buffer
+string gLog[];
+
+//--- Object tracker
+string gObjs[];
+
+//--- EMA handles (M5)
+int hFast, hMid, hSlow;
+
+//======================================================================
+//  INIT / DEINIT
+//======================================================================
+int OnInit()
+{
+   gSym = (InpSymbol == "") ? Symbol() : InpSymbol;
+   if(!SymbolSelect(gSym, true)){ Alert("Symbol not found: " + gSym); return INIT_FAILED; }
+
+   trade.SetDeviationInPoints(20);
+   trade.SetAsyncMode(false);
+
+   // Set runtime EMA from inputs
+   gEmaFast = InpEMA_Fast;
+   gEmaMid  = InpEMA_Mid;
+   gEmaSlow = InpEMA_Slow;
+
+   if(!ReinitEmaHandles()) return INIT_FAILED;
+
+   Log("EA v8.0 | " + gSym + " | EMA M5 " + (string)gEmaFast + "/" + (string)gEmaMid + "/" + (string)gEmaSlow, "info");
+   Log(StringFormat("SL buffer=%.0fpt | BE $%.0f>>+$%.0f | Close phut %02d", InpExtraPoints, InpBETrigger, InpBELock, InpCloseMinute), "info");
+
+   BuildPanel();
+   if(!InitCanvas()) Log("Canvas init failed - check MT5 version","err");
+
+   EventSetTimer(InpCheckInterval);
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   IndicatorRelease(hFast);
+   IndicatorRelease(hMid);
+   IndicatorRelease(hSlow);
+   if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
+   ObjDeleteAll();
+}
+
+//======================================================================
+//  EMA HANDLE MANAGEMENT
+//======================================================================
+bool ReinitEmaHandles()
+{
+   if(hFast != INVALID_HANDLE && hFast != 0) IndicatorRelease(hFast);
+   if(hMid  != INVALID_HANDLE && hMid  != 0) IndicatorRelease(hMid);
+   if(hSlow != INVALID_HANDLE && hSlow != 0) IndicatorRelease(hSlow);
+   hFast = iMA(gSym, PERIOD_M5, gEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+   hMid  = iMA(gSym, PERIOD_M5, gEmaMid,  0, MODE_EMA, PRICE_CLOSE);
+   hSlow = iMA(gSym, PERIOD_M5, gEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+   if(hFast==INVALID_HANDLE || hMid==INVALID_HANDLE || hSlow==INVALID_HANDLE)
+   { Alert("EMA handle error"); return false; }
+   return true;
+}
+
+//======================================================================
+//  CANVAS: INIT + DRAW
+//======================================================================
+bool InitCanvas()
+{
+   if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
+
+   // eby = InpPanelY + (py+48 cards_y) + 52(ch) + 8(gap) + 12(label) = InpPanelY+120
+   // Canvas starts at eby + 22 (after sub-header)
+   int cx = InpPanelX + 8;
+   int cy = InpPanelY + 142;   // 120 + 22
+
+   if(!gEmaCanvas.CreateBitmapLabel(0, 0, CANVAS_NAME, cx, cy, CANVAS_W, CANVAS_H, COLOR_FORMAT_ARGB_NORMALIZE))
+      return false;
+
+   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_BACK,       false);
+   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_ZORDER,     5);
+   Track(CANVAS_NAME);
+   gCanvasReady = true;
+   DrawEmaCanvas();
+   return true;
+}
+
+//----------------------------------------------------------------------
+void DrawEmaCanvas()
+{
+   if(!gCanvasReady) return;
+
+   int W = CANVAS_W, H = CANVAS_H;
+   int bars = CANVAS_BARS;
+
+   // ── Fetch EMA data only ─────────────────────────────────────────
+   double ef[], em[], es[];
+   ArraySetAsSeries(ef,true); ArraySetAsSeries(em,true); ArraySetAsSeries(es,true);
+   if(CopyBuffer(hFast,0,0,bars,ef)<bars) return;
+   if(CopyBuffer(hMid, 0,0,bars,em)<bars) return;
+   if(CopyBuffer(hSlow,0,0,bars,es)<bars) return;
+
+   // ── Price range (EMA values only) ───────────────────────────────
+   double mn=DBL_MAX, mx=-DBL_MAX;
+   for(int i=0;i<bars;i++)
+   {
+      mn = MathMin(mn, MathMin(ef[i], MathMin(em[i], es[i])));
+      mx = MathMax(mx, MathMax(ef[i], MathMax(em[i], es[i])));
+   }
+   double range = mx - mn;
+   if(range <= 0) return;
+   double pad = range * 0.10;
+   mn -= pad; mx += pad; range = mx - mn;
+
+   // ── Layout ──────────────────────────────────────────────────────
+   const int PL=4, PR=4, PT=5, PB=5;
+   int cW = W - PL - PR;
+   int cH = H - PT - PB;
+   double barW = (double)cW / bars;
+
+   // ── Clear background ────────────────────────────────────────────
+   gEmaCanvas.Erase(ColorToARGB(C'5,9,17',255));
+
+   // ── Horizontal grid (4 levels, dotted) ──────────────────────────
+   uint gridC = ColorToARGB(C'22,30,50',255);
+   for(int g=1;g<=3;g++)
+   {
+      int gy = PT + g*cH/4;
+      for(int x=PL; x<W-PR; x+=5)
+         gEmaCanvas.PixelSet(x, gy, gridC);
+   }
+
+   // ── Vertical grid every 10 bars ─────────────────────────────────
+   for(int vb=10; vb<bars; vb+=10)
+   {
+      int gx = PL + (int)((bars-vb)*barW + barW*0.5);
+      for(int y=PT; y<H-PB; y+=5)
+         gEmaCanvas.PixelSet(gx, y, gridC);
+   }
+
+   // ── EMA lines (Slow first so Fast draws on top) ──────────────────
+   uint cF = ColorToARGB(C_YELLOW, 230);
+   uint cM = ColorToARGB(C_CYAN,   220);
+   uint cS = ColorToARGB(C_ORANGE, 200);
+
+   for(int i=bars-2; i>=0; i--)
+   {
+      int bi0 = bars-1-(i+1);   // older bar → left
+      int bi1 = bars-1-i;       // newer bar → right
+      int xa = PL + (int)(bi0*barW + barW*0.5);
+      int xb = PL + (int)(bi1*barW + barW*0.5);
+
+      int yS0 = MathMax(PT,MathMin(H-PB, PT+(int)((mx-es[i+1])/range*cH)));
+      int yS1 = MathMax(PT,MathMin(H-PB, PT+(int)((mx-es[i])  /range*cH)));
+      int yM0 = MathMax(PT,MathMin(H-PB, PT+(int)((mx-em[i+1])/range*cH)));
+      int yM1 = MathMax(PT,MathMin(H-PB, PT+(int)((mx-em[i])  /range*cH)));
+      int yF0 = MathMax(PT,MathMin(H-PB, PT+(int)((mx-ef[i+1])/range*cH)));
+      int yF1 = MathMax(PT,MathMin(H-PB, PT+(int)((mx-ef[i])  /range*cH)));
+
+      gEmaCanvas.Line(xa, yS0, xb, yS1, cS);
+      gEmaCanvas.Line(xa, yM0, xb, yM1, cM);
+      gEmaCanvas.Line(xa, yF0, xb, yF1, cF);
+   }
+
+   // ── Crossover signal dots + price label ─────────────────────────
+   // Golden cross (Fast crosses ABOVE Mid) → BUY  → green dot
+   // Death cross  (Fast crosses BELOW Mid) → SELL → red dot
+   for(int i=bars-2; i>=1; i--)
+   {
+      bool wasBelowMid = (ef[i+1] <= em[i+1]);
+      bool nowAboveMid = (ef[i]   >  em[i]);
+      bool wasAboveMid = (ef[i+1] >= em[i+1]);
+      bool nowBelowMid = (ef[i]   <  em[i]);
+
+      bool goldenCross = wasBelowMid && nowAboveMid;
+      bool deathCross  = wasAboveMid && nowBelowMid;
+
+      if(!goldenCross && !deathCross) continue;
+
+      // ── Dot position ─────────────────────────────────────────────
+      int bi   = bars-1-i;
+      int xDot = PL + (int)(bi*barW + barW*0.5);
+
+      double midPrice = (ef[i] + em[i]) * 0.5;
+      int yDot = MathMax(PT+6, MathMin(H-PB-6, PT+(int)((mx-midPrice)/range*cH)));
+
+      // ── Draw dot ─────────────────────────────────────────────────
+      uint dotC  = goldenCross ? ColorToARGB(C_GREEN,245) : ColorToARGB(C_RED,245);
+      uint ringC = ColorToARGB(C'210,218,238',200);
+      gEmaCanvas.FillCircle(xDot, yDot, 5, dotC);
+      gEmaCanvas.Circle(xDot, yDot, 5, ringC);
+
+      // ── Price label ───────────────────────────────────────────────
+      // Format: 2 decimals (gold is usually XXXX.XX)
+      string priceStr = DoubleToString(midPrice, 2);
+      uint lblC = goldenCross ? ColorToARGB(C_GREEN,255) : ColorToARGB(C_RED,255);
+
+      // Label Y: place ABOVE dot for BUY, BELOW for SELL
+      // so it doesn't overlap the dot (dot radius=5 + 2px gap + ~8px font height)
+      int lblH = 12;   // approximate text height in pixels
+      int yLbl;
+      if(goldenCross) yLbl = yDot - 5 - 2 - lblH;
+      else            yLbl = yDot + 5 + 2;
+
+      yLbl = MathMax(PT, MathMin(H - PB - lblH, yLbl));
+
+      int lblW = (int)StringLen(priceStr) * 8;
+      int xLbl = xDot - lblW/2;
+      xLbl = MathMax(PL, MathMin(W - PR - lblW, xLbl));
+
+      gEmaCanvas.FillRectangle(xLbl-3, yLbl-1, xLbl+lblW+2, yLbl+lblH+1, ColorToARGB(C'5,9,17',210));
+
+      gEmaCanvas.FontSet("Arial Bold", 9);
+      gEmaCanvas.TextOut(xLbl, yLbl, priceStr, lblC);
+   }
+
+   // ── Current price dashed line ────────────────────────────────────
+   double cp = SymbolInfoDouble(gSym, SYMBOL_BID);
+   int yP = PT + (int)((mx-cp)/range*cH);
+   yP = MathMax(PT, MathMin(H-PB, yP));
+   for(int x=PL; x<W-PR; x+=6)
+   {
+      gEmaCanvas.PixelSet(x,   yP, ColorToARGB(C'160,168,195',160));
+      gEmaCanvas.PixelSet(x+1, yP, ColorToARGB(C'160,168,195',160));
+   }
+
+   // ── Legend dots (top-right) ──────────────────────────────────────
+   gEmaCanvas.FillCircle(W-52, PT+5, 3, ColorToARGB(C_YELLOW,230));
+   gEmaCanvas.FillCircle(W-36, PT+5, 3, ColorToARGB(C_CYAN,  220));
+   gEmaCanvas.FillCircle(W-20, PT+5, 3, ColorToARGB(C_ORANGE,210));
+
+   gEmaCanvas.Update();
+}
+
+//======================================================================
+//  EVENT HANDLERS
+//======================================================================
+void OnTick()  { PanelUpdate(); }
+
+void OnTimer()
+{
+   if(!gBatchRunning)
+   {
+      DoSetSL();
+      if(InpBEEnabled) DoBreakeven();
+      if(InpAutoClose) DoAutoClose();
+   }
+   // Redraw canvas only on new M5 bar (not every second)
+   datetime curBar = iTime(gSym, PERIOD_M5, 0);
+   if(curBar != gLastM5Bar){ gLastM5Bar = curBar; DrawEmaCanvas(); }
+   PanelUpdate();
+}
+
+void OnTradeTransaction(const MqlTradeTransaction& t,
+                        const MqlTradeRequest& r,
+                        const MqlTradeResult& s)
+{
+   if(t.type == TRADE_TRANSACTION_DEAL_ADD && !gBatchRunning){ Sleep(300); DoSetSL(); }
+}
+
+void OnChartEvent(const int id,const long& lp,const double& dp,const string& sp)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   // ── Hide/Show toggle ────────────────────────────────────────────
+   if(sp == "d_btn_hide")
+   {
+      gHidden = !gHidden;
+      PanelToggle();
+      ObjTxt("d_btn_hide", gHidden ? "[ SHOW ]" : "[ HIDE ]");
+      if(gCanvasReady)
+         ObjectSetInteger(0, CANVAS_NAME, OBJPROP_TIMEFRAMES, gHidden ? OBJ_NO_PERIODS : OBJ_ALL_PERIODS);
+      ChartRedraw(0);
+      return;
+   }
+
+   // ── EMA period buttons ──────────────────────────────────────────
+   bool changed = false;
+
+   // Fast: step 1, min 2, must stay < Mid-1
+   if(sp == "d_btn_f_dec")
+   {
+      if(gEmaFast > 2){ gEmaFast -= 1; if(gEmaFast >= gEmaMid) gEmaFast = gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; }
+   }
+   if(sp == "d_btn_f_inc")
+   {
+      gEmaFast += 1;
+      if(gEmaFast >= gEmaMid) gEmaFast = gEmaMid-1;
+      if(gEmaFast < 2) gEmaFast = 2;
+      changed = true;
+   }
+
+   // Mid: step 1, must stay > Fast+1 and < Slow-1
+   if(sp == "d_btn_m_dec")
+   {
+      if(gEmaMid > gEmaFast+1){ gEmaMid -= 1; if(gEmaMid<=gEmaFast)gEmaMid=gEmaFast+1; changed=true; }
+   }
+   if(sp == "d_btn_m_inc")
+   {
+      gEmaMid += 1;
+      if(gEmaMid >= gEmaSlow) gEmaMid = gEmaSlow-1;
+      if(gEmaMid <= gEmaFast) gEmaMid = gEmaFast+1;
+      changed = true;
+   }
+
+   // Slow: step 1, must stay > Mid+1
+   if(sp == "d_btn_s_dec")
+   {
+      if(gEmaSlow > gEmaMid+1){ gEmaSlow -= 1; changed=true; }
+   }
+   if(sp == "d_btn_s_inc")
+   {
+      gEmaSlow += 1; changed=true;
+   }
+
+   if(changed)
+   {
+      ReinitEmaHandles();
+      // Update period labels
+      ObjTxt("d_ema_fval", (string)gEmaFast);
+      ObjTxt("d_ema_mval", (string)gEmaMid);
+      ObjTxt("d_ema_sval", (string)gEmaSlow);
+      // Update section caption
+      ObjTxt("d_s_ema", StringFormat("EMA ANALYSIS  —  M5  ( %d / %d / %d )", gEmaFast, gEmaMid, gEmaSlow));
+      // Sub-header
+      ObjTxt("d_ema_shl", StringFormat("M5  %d / %d / %d", gEmaFast, gEmaMid, gEmaSlow));
+      Log(StringFormat("EMA changed: %d/%d/%d", gEmaFast, gEmaMid, gEmaSlow),"info");
+      Sleep(300);  // let handles warm up
+      DrawEmaCanvas();
+      ChartRedraw(0);
+   }
+}
+
+//======================================================================
+//  HELPERS
+//======================================================================
+double H1High() { double a[]; ArraySetAsSeries(a,true); if(CopyHigh(gSym,PERIOD_H1,0,1,a)<1) return 0; return a[0]; }
+double H1Low()  { double a[]; ArraySetAsSeries(a,true); if(CopyLow( gSym,PERIOD_H1,0,1,a)<1) return 0; return a[0]; }
+int    CntPos() { int c=0; for(int i=0;i<PositionsTotal();i++) if(posInfo.SelectByIndex(i)&&posInfo.Symbol()==gSym) c++; return c; }
+int    MnLeft() { MqlDateTime d; TimeToStruct(TimeCurrent(),d); int v=InpCloseMinute-d.min; if(v<0)v+=60; return v; }
+double TotPnL() { double p=0; for(int i=0;i<PositionsTotal();i++) if(posInfo.SelectByIndex(i)&&posInfo.Symbol()==gSym) p+=posInfo.Profit()+posInfo.Swap()+posInfo.Commission(); return p; }
+double USD2Pt(double usd,double lot){ if(lot<=0)return 0; double tv=SymbolInfoDouble(gSym,SYMBOL_TRADE_TICK_VALUE),ts=SymbolInfoDouble(gSym,SYMBOL_TRADE_TICK_SIZE); if(tv<=0||ts<=0)return 0; return usd*ts/(tv*lot); }
+
+bool InSL(ulong t){ for(int i=0;i<ArraySize(tickSL);i++) if(tickSL[i]==t) return true; return false; }
+bool InBE(ulong t){ for(int i=0;i<ArraySize(tickBE);i++) if(tickBE[i]==t) return true; return false; }
+void AddSL(ulong t){ if(InSL(t))return; int s=ArraySize(tickSL); ArrayResize(tickSL,s+1); tickSL[s]=t; }
+void AddBE(ulong t){ if(InBE(t))return; int s=ArraySize(tickBE); ArrayResize(tickBE,s+1); tickBE[s]=t; }
+void AddCL(ulong t){ int s=ArraySize(tickCL); ArrayResize(tickCL,s+1); tickCL[s]=t; }
+
+void CleanTicks()
+{
+   ulong a[]; int c=0;
+   for(int i=0;i<ArraySize(tickSL);i++) if(PositionSelectByTicket(tickSL[i])){ ArrayResize(a,c+1); a[c++]=tickSL[i]; }
+   ArrayResize(tickSL,c); for(int i=0;i<c;i++) tickSL[i]=a[i];
+   ulong b[]; int bc=0;
+   for(int i=0;i<ArraySize(tickBE);i++) if(PositionSelectByTicket(tickBE[i])){ ArrayResize(b,bc+1); b[bc++]=tickBE[i]; }
+   ArrayResize(tickBE,bc); for(int i=0;i<bc;i++) tickBE[i]=b[i];
+}
+
+bool ModRetry(ulong tk,double sl,double tp)
+{
+   for(int a=1;a<=InpRetryCount;a++)
+   {
+      if(trade.PositionModify(tk,sl,tp)) return true;
+      uint rc=trade.ResultRetcode();
+      if(rc==TRADE_RETCODE_INVALID_STOPS||rc==TRADE_RETCODE_TRADE_DISABLED||rc==TRADE_RETCODE_MARKET_CLOSED) return false;
+      if(a<InpRetryCount) Sleep(InpRetryDelay);
+   }
+   return false;
+}
+bool ClsRetry(ulong tk)
+{
+   for(int a=1;a<=InpRetryCount;a++)
+   {
+      if(trade.PositionClose(tk,ULONG_MAX)) return true;
+      if(!PositionSelectByTicket(tk)) return true;
+      uint rc=trade.ResultRetcode();
+      if(rc==TRADE_RETCODE_TRADE_DISABLED||rc==TRADE_RETCODE_MARKET_CLOSED) return false;
+      if(a<InpRetryCount) Sleep(InpRetryDelay);
+   }
+   return false;
+}
+
+//======================================================================
+//  CORE LOGIC
+//======================================================================
+void DoSetSL()
+{
+   double h1h=H1High(); if(h1h<=0) return;
+   double h1l=H1Low();  if(h1l<=0) return;
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   int    dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   double slS=NormalizeDouble(h1h+InpExtraPoints*pt,dg);
+   double slB=NormalizeDouble(h1l-InpExtraPoints*pt,dg);
+
+   ulong need[]; int nc=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      if(!posInfo.SelectByIndex(i)||posInfo.Symbol()!=gSym) continue;
+      int tp=(int)posInfo.PositionType(); ulong tk=posInfo.Ticket(); double cs=posInfo.StopLoss();
+      if(InpOnlyBuy&&tp!=POSITION_TYPE_BUY) continue;
+      if(InpOnlySell&&tp!=POSITION_TYPE_SELL) continue;
+      double tSL=(tp==POSITION_TYPE_BUY)?slB:slS;
+      bool done=InSL(tk);
+      if(cs!=0&&!InpOverwriteSL&&done) continue;
+      if(MathAbs(cs-tSL)<pt*0.5&&done) continue;
+      if(InBE(tk)){ if(tp==POSITION_TYPE_BUY&&cs>=tSL) continue; if(tp==POSITION_TYPE_SELL&&cs<=tSL) continue; }
+      ArrayResize(need,nc+1); need[nc++]=tk;
+   }
+   if(nc==0){ CleanTicks(); return; }
+
+   gBatchRunning=true;
+   int ok=0,fail=0;
+   for(int i=0;i<nc;i++)
+   {
+      if(!PositionSelectByTicket(need[i])) continue;
+      int tp=(int)PositionGetInteger(POSITION_TYPE);
+      double tSL=(tp==POSITION_TYPE_BUY)?slB:slS;
+      double tp2=PositionGetDouble(POSITION_TP);
+      if(ModRetry(need[i],tSL,tp2)){ ok++; statSLOk++; AddSL(need[i]); }
+      else{ fail++; statSLFail++; Log(StringFormat("FAIL SL #%I64u",need[i]),"err"); }
+      if(i<nc-1&&InpBatchDelay>0) Sleep(InpBatchDelay);
+   }
+   gBatchRunning=false;
+   Log(StringFormat("SL: %d OK / %d FAIL | BUY=%.2f SELL=%.2f",ok,fail,slB,slS),ok>0?"ok":"err");
+   if(InpAlertOnSet&&ok>0) Alert(StringFormat("[AutoSL] %d lenh | BUY SL=%.2f | SELL SL=%.2f",ok,slB,slS));
+   CleanTicks();
+}
+
+void DoBreakeven()
+{
+   int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      if(!posInfo.SelectByIndex(i)||posInfo.Symbol()!=gSym) continue;
+      int tp=(int)posInfo.PositionType(); ulong tk=posInfo.Ticket();
+      double lot=posInfo.Volume(),entry=posInfo.PriceOpen(),cSL=posInfo.StopLoss(),cTP=posInfo.TakeProfit();
+      double pnl=posInfo.Profit()+posInfo.Swap()+posInfo.Commission();
+      if((InpOnlyBuy&&tp!=POSITION_TYPE_BUY)||(InpOnlySell&&tp!=POSITION_TYPE_SELL)) continue;
+      if(InBE(tk)||pnl<InpBETrigger) continue;
+      double off=USD2Pt(InpBELock,lot); if(off<=0) continue;
+      double newSL=0;
+      if(tp==POSITION_TYPE_BUY){ newSL=NormalizeDouble(entry+off,dg); if(cSL>=newSL) continue; }
+      else                     { newSL=NormalizeDouble(entry-off,dg); if(cSL>0&&cSL<=newSL) continue; }
+      if(ModRetry(tk,newSL,cTP))
+      {
+         statBEOk++; AddBE(tk);
+         string dir=(tp==POSITION_TYPE_BUY)?"BUY":"SELL";
+         Log(StringFormat("BE+ #%I64u %s $%.2f >> SL=%.2f (+$%.2f)",tk,dir,pnl,newSL,InpBELock),"ok");
+         Alert(StringFormat("[BE+] #%I64u %s | Lai=$%.2f | SL=%.2f | Lock +$%.2f",tk,dir,pnl,newSL,InpBELock));
+      }
+   }
+}
+
+void DoAutoClose()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(),dt); int cm=dt.min;
+   if(gCloseTrig&&cm!=InpCloseMinute) gCloseTrig=false;
+   int ml=InpCloseMinute-cm; if(ml<0)ml+=60;
+   if(ml>0&&ml<=InpCloseWarning&&gLastWarnMn!=cm)
+   { int cnt=CntPos(); if(cnt>0){ Log(StringFormat("CANH BAO: %d phut | %d lenh",ml,cnt),"warn"); gLastWarnMn=cm; } }
+   if(cm!=InpCloseMinute||gCloseTrig) return;
+
+   ulong tc[]; int tcc=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      if(!posInfo.SelectByIndex(i)||posInfo.Symbol()!=gSym) continue;
+      int tp=(int)posInfo.PositionType();
+      if((InpOnlyBuy&&tp!=POSITION_TYPE_BUY)||(InpOnlySell&&tp!=POSITION_TYPE_SELL)) continue;
+      ArrayResize(tc,tcc+1); tc[tcc++]=posInfo.Ticket();
+   }
+   if(tcc==0){ gCloseTrig=true; return; }
+   gBatchRunning=true;
+   Log(StringFormat("AUTO CLOSE: dong %d lenh @ phut %02d",tcc,InpCloseMinute),"warn");
+   int ok=0,fail=0;
+   for(int i=0;i<tcc;i++)
+   {
+      if(ClsRetry(tc[i])){ ok++; statClOk++; AddCL(tc[i]); }
+      else{ fail++; statClFail++; }
+      if(i<tcc-1&&InpBatchDelay>0) Sleep(InpBatchDelay);
+   }
+   gBatchRunning=false; gCloseTrig=true; gLastCloseMn=cm;
+   Log(StringFormat("Close: %d OK / %d FAIL",ok,fail),ok>0?"ok":"err");
+   if(InpAlertOnClose) Alert(StringFormat("[AutoClose] %d/%d lenh @ phut %02d",ok,tcc,InpCloseMinute));
+}
+
+//======================================================================
+//  EMA M5 ANALYSIS
+//======================================================================
+struct EmaSnap { double f,m,s,fp,mp,sp,price; };
+struct Signal  { string trend,sig,str,reason; color tc,sc; int score; };
+
+bool GetEMA(EmaSnap& e)
+{
+   double f[],m[],s[];
+   ArraySetAsSeries(f,true); ArraySetAsSeries(m,true); ArraySetAsSeries(s,true);
+   if(CopyBuffer(hFast,0,0,3,f)<3||CopyBuffer(hMid,0,0,3,m)<3||CopyBuffer(hSlow,0,0,3,s)<3) return false;
+   e.f=f[0];e.fp=f[1]; e.m=m[0];e.mp=m[1]; e.s=s[0];e.sp=s[1];
+   e.price=SymbolInfoDouble(gSym,SYMBOL_BID);
+   return true;
+}
+
+Signal Analyze(EmaSnap& e)
+{
+   Signal r;
+   r.score=50;
+   bool fAboveM=e.f>e.m, fAboveS=e.f>e.s, mAboveS=e.m>e.s;
+   bool pAboveF=e.price>e.f, pAboveM=e.price>e.m, pAboveS=e.price>e.s;
+   bool fRising=e.f>e.fp, mRising=e.m>e.mp;
+   bool golden=(e.f>e.m)&&(e.fp<=e.mp);
+   bool death =(e.f<e.m)&&(e.fp>=e.mp);
+
+   if(fAboveM) r.score+=10; else r.score-=10;
+   if(fAboveS) r.score+=12; else r.score-=12;
+   if(mAboveS) r.score+=10; else r.score-=10;
+   if(pAboveF) r.score+=6;  else r.score-=6;
+   if(pAboveM) r.score+=6;  else r.score-=6;
+   if(pAboveS) r.score+=6;  else r.score-=6;
+   if(fRising) r.score+=5;  else r.score-=5;
+   if(mRising) r.score+=5;  else r.score-=5;
+   r.score=MathMax(0,MathMin(100,r.score));
+
+   if(r.score>=65)      { r.trend="BULLISH"; r.tc=C_GREEN;  }
+   else if(r.score<=35) { r.trend="BEARISH"; r.tc=C_RED;    }
+   else                 { r.trend="SIDEWAY"; r.tc=C_ORANGE; }
+
+   if(golden&&mAboveS)
+   { r.sig="BUY";  r.sc=C_GREEN;  r.str="MANH";       r.reason=StringFormat("Golden Cross EMA%d/%d | Stack bullish M5",gEmaFast,gEmaMid); }
+   else if(death&&!mAboveS)
+   { r.sig="SELL"; r.sc=C_RED;    r.str="MANH";       r.reason=StringFormat("Death Cross EMA%d/%d | Stack bearish M5",gEmaFast,gEmaMid); }
+   else if(r.trend=="BULLISH"&&pAboveF&&pAboveM&&fAboveS)
+   { r.sig="BUY";  r.sc=C_GREEN;  r.str="TRUNG BINH"; r.reason=StringFormat("Gia > EMA%d & EMA%d | Xu huong tang M5",gEmaFast,gEmaMid); }
+   else if(r.trend=="BEARISH"&&!pAboveF&&!pAboveM&&!fAboveS)
+   { r.sig="SELL"; r.sc=C_RED;    r.str="TRUNG BINH"; r.reason=StringFormat("Gia < EMA%d & EMA%d | Xu huong giam M5",gEmaFast,gEmaMid); }
+   else if(r.trend=="BULLISH"&&!pAboveF&&pAboveM)
+   { r.sig="BUY";  r.sc=C_YELLOW; r.str="YEU";        r.reason=StringFormat("Pullback EMA%d | Cho nen xac nhan M5",gEmaFast); }
+   else if(r.trend=="BEARISH"&&pAboveF&&!pAboveM)
+   { r.sig="SELL"; r.sc=C_YELLOW; r.str="YEU";        r.reason=StringFormat("Pullback EMA%d | Cho nen xac nhan M5",gEmaFast); }
+   else
+   { r.sig="WAIT"; r.sc=C_ORANGE; r.str="---";        r.reason="EMA M5 chua xac dinh xu huong ro rang"; }
+   return r;
+}
+
+//======================================================================
+//  LOG
+//======================================================================
+void Log(string msg,string typ)
+{
+   MqlDateTime d; TimeToStruct(TimeCurrent(),d);
+   string ts=StringFormat("%02d:%02d:%02d",d.hour,d.min,d.sec);
+   string line="["+ts+"] "+msg+"|"+typ;
+   int sz=ArraySize(gLog);
+   if(sz>=InpMaxLog){ for(int i=0;i<sz-1;i++) gLog[i]=gLog[i+1]; gLog[sz-1]=line; }
+   else{ ArrayResize(gLog,sz+1); gLog[sz]=line; }
+   Print("[EA] "+msg);
+}
+
+//======================================================================
+//  DRAWING ENGINE
+//======================================================================
+void Track(string n)
+{
+   int s=ArraySize(gObjs);
+   for(int i=0;i<s;i++) if(gObjs[i]==n) return;
+   ArrayResize(gObjs,s+1); gObjs[s]=n;
+}
+void ObjDeleteAll()
+{
+   for(int i=0;i<ArraySize(gObjs);i++) ObjectDelete(0,gObjs[i]);
+   ArrayResize(gObjs,0); ChartRedraw(0);
+}
+
+void Rect(string n,int x,int y,int w,int h,color bg,color bd,int bw=1)
+{
+   ObjectCreate(0,n,OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x); ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,n,OBJPROP_XSIZE,w);     ObjectSetInteger(0,n,OBJPROP_YSIZE,h);
+   ObjectSetInteger(0,n,OBJPROP_BGCOLOR,bg);  ObjectSetInteger(0,n,OBJPROP_COLOR,bd);
+   ObjectSetInteger(0,n,OBJPROP_BORDER_TYPE,BORDER_FLAT); ObjectSetInteger(0,n,OBJPROP_WIDTH,bw);
+   ObjectSetInteger(0,n,OBJPROP_BACK,false);  ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,n,OBJPROP_ZORDER,0); Track(n);
+}
+
+void Lbl(string n,int x,int y,string txt,color clr,int fs,bool bold=false)
+{
+   ObjectCreate(0,n,OBJ_LABEL,0,0,0);
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x); ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt);     ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fs); ObjectSetString(0,n,OBJPROP_FONT,bold?"Arial Bold":"Arial");
+   ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,n,OBJPROP_BACK,false);
+   ObjectSetInteger(0,n,OBJPROP_ZORDER,10); Track(n);
+}
+
+void Btn(string n,int x,int y,int w,int h,string txt,color bg,color clr,int fs)
+{
+   Rect(n+"_bg",x,y,w,h,bg,C_BDR2,1);
+   ObjectCreate(0,n,OBJ_LABEL,0,0,0);
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x+MathMax(1,(w-(int)StringLen(txt)*fs)/2));
+   ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y+(h-fs*2)/2+1);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt);       ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fs);   ObjectSetString(0,n,OBJPROP_FONT,"Arial Bold");
+   ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,true); ObjectSetInteger(0,n,OBJPROP_BACK,false);
+   ObjectSetInteger(0,n,OBJPROP_ZORDER,20); Track(n);
+}
+
+void ObjTxt(string n,string v) { ObjectSetString(0,n,OBJPROP_TEXT,v); }
+void ObjClr(string n,color v)  { ObjectSetInteger(0,n,OBJPROP_COLOR,v); }
+void ObjW(string n,int v)      { ObjectSetInteger(0,n,OBJPROP_XSIZE,v); }
+void ObjBg(string n,color v)   { ObjectSetInteger(0,n,OBJPROP_BGCOLOR,v); ObjectSetInteger(0,n,OBJPROP_COLOR,v); }
+void ObjVis(string n,bool v)   { ObjectSetInteger(0,n,OBJPROP_TIMEFRAMES,v?OBJ_ALL_PERIODS:OBJ_NO_PERIODS); }
+
+//======================================================================
+//  BUILD PANEL  (v8 - EMA section replaced with canvas + controls)
+//======================================================================
+void BuildPanel()
+{
+   ObjDeleteAll();
+   int px=InpPanelX, py=InpPanelY;
+
+   // Total height: old 490 + delta(EMA_CARD_H-126=44) + log rows
+   int totH = 594 + InpMaxLog*RLOG;
+
+   Rect("d_sh", px+3,py+3, PW,totH, C'6,8,14',C'6,8,14',0);
+   Rect("d_bg", px,  py,   PW,totH, C_BG, C_BDR2, 1);
+
+   // ── HEADER ─────────────────────────────────────────────────────
+   Rect("d_hdr_bg",   px,py, PW,30, C_HDR,C_BDR2,0);
+   Rect("d_hdr_line", px,py, PW,2,  C_GOLD,C_GOLD,0);
+   Lbl("d_hdr_title", px+11, py+9,  "Auto tracking",  C_GOLD,  10,true);
+   Lbl("d_hdr_pipe",  px+90, py+10, "|",           C_MUTED2, 8);
+   Lbl("d_hdr_sym",   px+98, py+9,  gSym,          C_WHITE,  10,true);
+   Lbl("d_hdr_status",px+248,py+9,  "[RUNNING]",    C_GREEN,  8,true);
+   Btn("d_btn_hide",  px+PW-52,py+5, 46,20,"[ X ]", C_CARD,C_CYAN,7);
+
+   // ── SECTION A: 4 METRIC CARDS ─────────────────────────────────
+   int ay=py+36;
+   Lbl("d_s_ov",px+10,ay,"OVERVIEW",C_MUTED,7);
+   int cy_=ay+12, cw=103, ch=52, cg=3;
+
+   // Card 1 - Positions
+   Rect("d_c1", px+5,          cy_,cw,ch,C_CARD,C_BDR);
+   Rect("d_c1t",px+5,          cy_,cw,2, C_BLUE,C_BLUE,0);
+   Lbl("d_c1l", px+10,         cy_+7,  "POSITIONS", C_MUTED,7);
+   Lbl("d_c1v", px+10,         cy_+18, "0",         C_WHITE,18,true);
+   Lbl("d_c1s", px+10,         cy_+41, "lenh mo",   C_MUTED,7);
+
+   // Card 2 - P&L
+   Rect("d_c2", px+5+cw+cg,   cy_,cw,ch,C_CARD,C_BDR);
+   Rect("d_c2t",px+5+cw+cg,   cy_,cw,2, C_GREEN,C_GREEN,0);
+   Lbl("d_c2l", px+10+cw+cg,  cy_+7,  "TOTAL P&L", C_MUTED,7);
+   Lbl("d_c2v", px+10+cw+cg,  cy_+18, "+0.00",     C_GREEN,12,true);
+   Lbl("d_c2s", px+10+cw+cg,  cy_+42, "USD",       C_MUTED,7);
+
+   // Card 3 - SL OK
+   Rect("d_c3", px+5+(cw+cg)*2,  cy_,cw,ch,C_CARD,C_BDR);
+   Rect("d_c3t",px+5+(cw+cg)*2,  cy_,cw,2, C_CYAN,C_CYAN,0);
+   Lbl("d_c3l", px+10+(cw+cg)*2, cy_+7,  "SL SET",  C_MUTED,7);
+   Lbl("d_c3v", px+10+(cw+cg)*2, cy_+18, "0",       C_CYAN, 18,true);
+   Lbl("d_c3s", px+10+(cw+cg)*2, cy_+42, "lenh OK", C_MUTED,7);
+
+   // Card 4 - BE
+   Rect("d_c4", px+5+(cw+cg)*3,  cy_,cw,ch,C_CARD,C_BDR);
+   Rect("d_c4t",px+5+(cw+cg)*3,  cy_,cw,2, C_PURPLE,C_PURPLE,0);
+   Lbl("d_c4l", px+10+(cw+cg)*3, cy_+7,  "BREAKEVEN", C_MUTED, 7);
+   Lbl("d_c4v", px+10+(cw+cg)*3, cy_+18, "0",         C_PURPLE,18,true);
+   Lbl("d_c4s", px+10+(cw+cg)*3, cy_+42, "locked",    C_MUTED, 7);
+
+   // ── SECTION B: EMA M5 CANVAS CHART ────────────────────────────
+   int by = cy_+ch+8;
+   Lbl("d_s_ema",px+10,by,
+       StringFormat("EMA ANALYSIS  —  M5  ( %d / %d / %d )",gEmaFast,gEmaMid,gEmaSlow),C_MUTED,7);
+   int eby = by+12;
+
+   // Outer card
+   Rect("d_ema_bg",  px+5, eby, PW-10, EMA_CARD_H, C_CARD, C_BDR);
+   Rect("d_ema_top", px+5, eby, PW-10, 2,           C_GOLD2,C_GOLD2,0);
+
+   // Sub-header (shows current EMA config + trend badge)
+   Rect("d_ema_sh", px+5, eby+2, PW-10, 20, C_CARD2, C_BDR, 0);
+   Lbl("d_ema_shl", px+12,  eby+8,
+       StringFormat("M5  %d / %d / %d", gEmaFast,gEmaMid,gEmaSlow), C_MUTED,7);
+   // Legend dots in sub-header
+   Rect("d_leg_f",  px+108, eby+9, 6,6, C_YELLOW, C_YELLOW,0);
+   Rect("d_leg_m",  px+130, eby+9, 6,6, C_CYAN,   C_CYAN,  0);
+   Rect("d_leg_s",  px+152, eby+9, 6,6, C_ORANGE, C_ORANGE,0);
+   Lbl("d_leg_fl",  px+117, eby+8, "F", C_YELLOW, 7,true);
+   Lbl("d_leg_ml",  px+139, eby+8, "M", C_CYAN,   7,true);
+   Lbl("d_leg_sl",  px+161, eby+8, "S", C_ORANGE, 7,true);
+   // Trend badge (right side)
+   Lbl("d_ema_shbdg",px+320, eby+8, "ANALYZING...", C_ORANGE,8,true);
+
+   // Canvas border frame (canvas itself created in InitCanvas)
+   Rect("d_ema_cvbrd", px+7, eby+22, CANVAS_W+2, CANVAS_H+2, C'5,9,17', C_BDR2, 1);
+
+   // ── EMA PERIOD CONTROLS (below canvas) ──────────────────────────
+   // Layout: eby+22 + CANVAS_H + 2(border) + 2(gap) = eby+114
+   int cty = eby + 22 + CANVAS_H + 4;   // = eby+114
+   Rect("d_ema_ctrl", px+5, cty, PW-10, 22, C_CARD2, C_BDR, 0);
+
+   // Group 1: Fast (yellow)
+   int g1x = px+12;
+   Rect("d_ema_f_dot",  g1x,    cty+8, 6,6, C_YELLOW,C_YELLOW,0);
+   Lbl("d_ema_fl2",     g1x+9,  cty+5, "F:", C_MUTED,7);
+   Lbl("d_ema_fval",    g1x+24, cty+4, (string)gEmaFast, C_YELLOW,8,true);
+   Btn("d_btn_f_dec",   g1x+52, cty+4, 15,14, "-", C_CARD, C_RED,  8);
+   Btn("d_btn_f_inc",   g1x+69, cty+4, 15,14, "+", C_CARD, C_GREEN,8);
+
+   // Group 2: Mid (cyan)
+   int g2x = px+12+108;
+   Rect("d_ema_m_dot",  g2x,    cty+8, 6,6, C_CYAN,C_CYAN,0);
+   Lbl("d_ema_ml2",     g2x+9,  cty+5, "M:", C_MUTED,7);
+   Lbl("d_ema_mval",    g2x+24, cty+4, (string)gEmaMid, C_CYAN,8,true);
+   Btn("d_btn_m_dec",   g2x+52, cty+4, 15,14, "-", C_CARD, C_RED,  8);
+   Btn("d_btn_m_inc",   g2x+69, cty+4, 15,14, "+", C_CARD, C_GREEN,8);
+
+   // Group 3: Slow (orange)
+   int g3x = px+12+216;
+   Rect("d_ema_s_dot",  g3x,    cty+8, 6,6, C_ORANGE,C_ORANGE,0);
+   Lbl("d_ema_sl2",     g3x+9,  cty+5, "S:", C_MUTED,7);
+   Lbl("d_ema_sval",    g3x+24, cty+4, (string)gEmaSlow, C_ORANGE,8,true);
+   Btn("d_btn_s_dec",   g3x+56, cty+4, 15,14, "-", C_CARD, C_RED,  8);
+   Btn("d_btn_s_inc",   g3x+73, cty+4, 15,14, "+", C_CARD, C_GREEN,8);
+
+   // Score display (far right of controls)
+   Lbl("d_ema_sc_l",  px+PW-70, cty+5, "SCORE:", C_MUTED,7);
+   Lbl("d_ema_score_v",px+PW-36,cty+4, "50",     C_ORANGE,8,true);
+
+   // ── SIGNAL ROW (trend | signal | strength) ──────────────────────
+   int sry = cty + 22 + 2;   // = eby+138
+   Rect("d_ema_sig_bg", px+5, sry, PW-10, 18, C_CARD2, C_BDR, 0);
+   Lbl("d_ema_trl",  px+12,  sry+4, "TREND:",    C_MUTED,7);
+   Lbl("d_ema_trv",  px+52,  sry+4, "---",       C_ORANGE,8,true);
+   // Separator
+   Rect("d_sig_s1",  px+118, sry+3, 1,12, C_MUTED2,C_MUTED2,0);
+   Lbl("d_ema_sgl",  px+125, sry+4, "SIGNAL:",   C_MUTED,7);
+   Lbl("d_ema_sgv",  px+170, sry+4, "WAIT",      C_ORANGE,8,true);
+   // Separator
+   Rect("d_sig_s2",  px+222, sry+3, 1,12, C_MUTED2,C_MUTED2,0);
+   Lbl("d_ema_stl",  px+230, sry+4, "STRENGTH:", C_MUTED,7);
+   Lbl("d_ema_stv",  px+297, sry+4, "---",       C_MUTED,8,true);
+
+   // ── REASON + SCORE BAR ──────────────────────────────────────────
+   int rsy = sry + 20;    // = eby+158
+   Lbl("d_ema_rsn",    px+12, rsy, "...", C_MUTED,7);
+   // Score bar (at bottom of card)
+   int sbY = eby + EMA_CARD_H - 4;
+   Rect("d_sbar_bg",   px+5,  sbY, PW-10, 3, C_CARD2,C_CARD2,0);
+   Rect("d_sbar_fill", px+5,  sbY, 0,     3, C_GREEN,C_GREEN,0);
+
+   // ── SECTION C: SL + CLOSE ─────────────────────────────────────
+   int ccY  = eby + EMA_CARD_H + 8;
+   Lbl("d_s_sl",px+10,ccY,"STOP LOSS  &  CLOSE",C_MUTED,7);
+   int ccyy = ccY+12;
+   int hw   = (PW-15)/2;
+
+   Rect("d_sl_c",px+5,         ccyy,hw,78,C_CARD,C_BDR);
+   Rect("d_sl_t",px+5,         ccyy,hw,2, C_CYAN,C_CYAN,0);
+   Lbl("d_sl_hd",px+11,        ccyy+8,  "STOP LOSS H1",   C_CYAN, 8,true);
+   Lbl("d_sl_bl",px+11,        ccyy+24, "BUY SL:",        C_MUTED,8);
+   Lbl("d_sl_bv",px+78,        ccyy+24, "---",            C_BLUE, 8,true);
+   Lbl("d_sl_sl",px+11,        ccyy+40, "SELL SL:",       C_MUTED,8);
+   Lbl("d_sl_sv",px+78,        ccyy+40, "---",            C_RED,  8,true);
+   Lbl("d_sl_st",px+11,        ccyy+58, "0 OK / 0 FAIL",  C_GREEN,7);
+   Lbl("d_sl_rt",px+11,        ccyy+68, "",               C_MUTED,7);
+
+   Rect("d_cl_c",px+5+hw+5,    ccyy,hw,78,C_CARD,C_BDR);
+   Rect("d_cl_t",px+5+hw+5,    ccyy,hw,2, C_YELLOW,C_YELLOW,0);
+   Lbl("d_cl_hd",px+11+hw+5,   ccyy+8,  "AUTO CLOSE",     C_YELLOW,8,true);
+   Lbl("d_cl_ml",px+11+hw+5,   ccyy+24, "Phut dong:",     C_MUTED, 8);
+   Lbl("d_cl_mv",px+82+hw+5,   ccyy+24,
+       InpAutoClose?StringFormat(":%02d",InpCloseMinute):"OFF",
+       InpAutoClose?C_YELLOW:C_MUTED, 8,true);
+   Lbl("d_cl_cdl",px+11+hw+5,  ccyy+40, "Countdown:",     C_MUTED,8);
+   Lbl("d_cl_cdv",px+82+hw+5,  ccyy+40, "--",             C_CYAN, 8,true);
+   Lbl("d_cl_st", px+11+hw+5,  ccyy+58, "0 OK / 0 FAIL",  C_GREEN,7);
+   Lbl("d_cl_be", px+11+hw+5,  ccyy+68,
+       InpBEEnabled?StringFormat("BE: $%.0f >> lock +$%.0f",InpBETrigger,InpBELock):"BE: OFF",
+       InpBEEnabled?C_PURPLE:C_MUTED, 7);
+
+   // ── SECTION D: COUNTDOWN BAR ──────────────────────────────────
+   int dy=ccyy+78+5;
+   Rect("d_cd_c",  px+5,   dy, PW-10,20, C_CARD2,C_BDR);
+   Lbl("d_cd_lbl", px+11,  dy+5, "CLOSE TIMER:", C_MUTED,7);
+   Rect("d_cd_bg", px+102, dy+6, PW-114,8, C'14,20,34',C_BDR);
+   Rect("d_cd_fill",px+102,dy+6, 0,     8, C_GREEN,C_GREEN,0);
+   Lbl("d_cd_txt", px+110, dy+5, "-- phut nua", C_WHITE,7,true);
+
+   // ── SECTION E: BATCH BAR ──────────────────────────────────────
+   int ey=dy+20+4;
+   Rect("d_bt_bg",px+5, ey,PW-10,18,C_CARD2,C_BDR);
+   Lbl("d_bt_l",  px+11,ey+4,"BATCH:", C_MUTED,7);
+   Lbl("d_bt_v",  px+50,ey+4,"STANDBY",C_GREEN,7,true);
+   Lbl("d_bt_s1", px+115,ey+4,"|",     C_MUTED2,7);
+   Lbl("d_bt_be", px+122,ey+4,
+       InpBEEnabled?StringFormat("BE $%.0f>>+$%.0f",InpBETrigger,InpBELock):"BE:OFF",
+       InpBEEnabled?C_PURPLE:C_MUTED,7);
+   Lbl("d_bt_s2", px+250,ey+4,"|",     C_MUTED2,7);
+   Lbl("d_bt_rt", px+257,ey+4,
+       StringFormat("Retry %dx%dms | Delay %dms",InpRetryCount,InpRetryDelay,InpBatchDelay),C_MUTED,7);
+
+   // ── SECTION F: LOG ────────────────────────────────────────────
+   int fy=ey+18+5;
+   Lbl("d_log_l",px+10,fy,"JOURNAL",C_MUTED,7);
+   int lgy=fy+11;
+   Rect("d_log_bg",px+5,lgy,PW-10,InpMaxLog*RLOG+6,C'8,12,20',C_BDR);
+   for(int i=0;i<InpMaxLog;i++)
+      Lbl(StringFormat("d_log%d",i),px+10,lgy+3+i*RLOG,"",C_MUTED,7);
+
+   // ── FOOTER ────────────────────────────────────────────────────
+   int ffY=lgy+InpMaxLog*RLOG+10;
+   Rect("d_ft_bg",  px,ffY, PW,16, C'10,13,20',C_BDR,0);
+   Rect("d_ft_line",px,ffY, PW,1,  C_GOLD2,C_GOLD2,0);
+   Lbl("d_ft_sym",  px+10, ffY+4, gSym,             C_GOLD,  7,true);
+   Lbl("d_ft_s1",   px+50, ffY+4, "|",              C_MUTED2,7);
+   Lbl("d_ft_time", px+58, ffY+4, "",               C_MUTED, 7);
+   Lbl("d_ft_s2",   px+195,ffY+4, "|",              C_MUTED2,7);
+   Lbl("d_ft_srv",  px+203,ffY+4, "copyright by TVH-SMILE - v1.0",C_MUTED, 7);
+
+   ChartRedraw(0);
+}
+
+//======================================================================
+//  PANEL TOGGLE VISIBILITY
+//======================================================================
+void PanelToggle()
+{
+   for(int i=0;i<ArraySize(gObjs);i++)
+   {
+      string n=gObjs[i];
+      if(n=="d_bg"||n=="d_sh"||n=="d_hdr_bg"||n=="d_hdr_line"||
+         n=="d_hdr_title"||n=="d_hdr_pipe"||n=="d_hdr_sym"||
+         n=="d_hdr_ver"||n=="d_hdr_status"||n=="d_hdr_clock"||
+         n=="d_btn_hide"||n=="d_btn_hide_bg") continue;
+      ObjVis(n,!gHidden);
+   }
+}
+
+//======================================================================
+//  PANEL UPDATE
+//======================================================================
+void PanelUpdate()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(),dt);
+   ObjTxt("d_hdr_clock",TimeToString(TimeCurrent(),TIME_SECONDS));
+
+   if(gHidden){ ChartRedraw(0); return; }
+
+   double h1h=H1High(), h1l=H1Low();
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   int    dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   double slS=NormalizeDouble(h1h+InpExtraPoints*pt,dg);
+   double slB=NormalizeDouble(h1l-InpExtraPoints*pt,dg);
+   int    pc =CntPos();
+   double pnl=TotPnL();
+   int    ml =MnLeft();
+   bool isClose=(dt.min==InpCloseMinute&&InpAutoClose);
+   bool isWarn =(ml<=InpCloseWarning&&ml>0&&InpAutoClose);
+
+   // Header status
+   if(gBatchRunning)    { ObjTxt("d_hdr_status","[BUSY]");    ObjClr("d_hdr_status",C_ORANGE); }
+   else if(isClose)     { ObjTxt("d_hdr_status","[CLOSING]"); ObjClr("d_hdr_status",C_RED);    }
+   else                 { ObjTxt("d_hdr_status","[RUNNING]"); ObjClr("d_hdr_status",C_GREEN);  }
+
+   // Metric cards
+   ObjTxt("d_c1v",(string)pc);
+   ObjClr("d_c1v",pc>0?C_WHITE:C_MUTED);
+   ObjTxt("d_c1s",pc>0?"lenh mo":"trong");
+
+   string ps=(pnl>=0?"+":"")+DoubleToString(pnl,2);
+   ObjTxt("d_c2v",ps);
+   ObjClr("d_c2v",pnl>0?C_GREEN:pnl<0?C_RED:C_MUTED);
+   ObjectSetInteger(0,"d_c2t",OBJPROP_BGCOLOR,pnl>0?C_GREEN:pnl<0?C_RED:C_BDR);
+   ObjectSetInteger(0,"d_c2t",OBJPROP_COLOR,  pnl>0?C_GREEN:pnl<0?C_RED:C_BDR);
+
+   ObjTxt("d_c3v",(string)statSLOk);
+   ObjTxt("d_c4v",(string)statBEOk);
+   ObjClr("d_c4v",statBEOk>0?C_PURPLE:C_MUTED);
+
+   // ── EMA signal labels (canvas redraws separately on M5 bar) ─────
+   EmaSnap ema; Signal sig;
+   if(GetEMA(ema))
+   {
+      sig = Analyze(ema);
+      // Trend badge in sub-header
+      ObjTxt("d_ema_shbdg", sig.trend); ObjClr("d_ema_shbdg", sig.tc);
+      // Signal row
+      ObjTxt("d_ema_trv", sig.trend);   ObjClr("d_ema_trv", sig.tc);
+      ObjTxt("d_ema_sgv", sig.sig);     ObjClr("d_ema_sgv", sig.sc);
+      ObjTxt("d_ema_stv", sig.str);
+      ObjClr("d_ema_stv", sig.str=="MANH"?C_GREEN:sig.str=="TRUNG BINH"?C_YELLOW:C_ORANGE);
+      ObjTxt("d_ema_rsn", sig.reason);
+      // Score
+      ObjTxt("d_ema_score_v", (string)sig.score);
+      ObjClr("d_ema_score_v", sig.tc);
+      // Score bar
+      int sbW=(int)((PW-10)*sig.score/100.0);
+      ObjW("d_sbar_fill", sbW);
+      ObjBg("d_sbar_fill", sig.tc);
+      // Also redraw canvas on price change (fast update path)
+      // Heavy redraw is handled in OnTimer per M5 bar; here just update price line
+      // (skip here; OnTimer handles it)
+   }
+
+   // SL card
+   ObjTxt("d_sl_bv", DoubleToString(slB,2));
+   ObjTxt("d_sl_sv", DoubleToString(slS,2));
+   int slt=statSLOk+statSLFail;
+   ObjTxt("d_sl_st",StringFormat("%d OK / %d FAIL (%d%%)",statSLOk,statSLFail,slt>0?(int)(statSLOk*100.0/slt):0));
+   ObjClr("d_sl_st",statSLFail>0?C_ORANGE:C_GREEN);
+   ObjTxt("d_sl_rt",StringFormat("Buffer: %.0f pts",InpExtraPoints));
+
+   // Close card
+   string cds; color cdc;
+   if(isClose)    { cds="DONG NGAY!";                      cdc=C_RED;    }
+   else if(isWarn){ cds=StringFormat("!! %d PHUT !!",ml);  cdc=C_ORANGE; }
+   else           { cds=StringFormat("%d phut nua",ml);     cdc=C_CYAN;   }
+   ObjTxt("d_cl_cdv",cds); ObjClr("d_cl_cdv",cdc);
+   ObjTxt("d_cl_st",StringFormat("%d OK / %d FAIL",statClOk,statClFail));
+   ObjClr("d_cl_st",statClFail>0?C_ORANGE:C_GREEN);
+
+   // Countdown bar
+   int barMaxW=PW-114;
+   int barFill=MathMax(0,MathMin((int)(barMaxW*(1.0-ml/60.0)),barMaxW));
+   ObjW("d_cd_fill",barFill);
+   color bc=isClose?C_RED:isWarn?C_ORANGE:C_GREEN;
+   ObjBg("d_cd_fill",bc);
+   int s2c=ml*60-dt.sec; if(s2c<0)s2c=0;
+   ObjTxt("d_cd_txt",StringFormat("%02d:%02d den phut :%02d",s2c/60,s2c%60,InpCloseMinute));
+   ObjClr("d_cd_txt",bc);
+
+   // Batch bar
+   if(gBatchRunning)      { ObjTxt("d_bt_v","PROCESSING..."); ObjClr("d_bt_v",C_ORANGE); }
+   else if(isClose&&pc>0) { ObjTxt("d_bt_v","CLOSING ALL");   ObjClr("d_bt_v",C_RED);    }
+   else if(isWarn&&pc>0)  { ObjTxt("d_bt_v",StringFormat("WARN -%dmin",ml)); ObjClr("d_bt_v",C_ORANGE); }
+   else                   { ObjTxt("d_bt_v","STANDBY");        ObjClr("d_bt_v",C_GREEN);  }
+
+   // Log
+   int lsz=ArraySize(gLog);
+   for(int i=0;i<InpMaxLog;i++)
+   {
+      int idx=lsz-InpMaxLog+i;
+      if(idx<0||idx>=lsz){ ObjTxt(StringFormat("d_log%d",i),""); continue; }
+      string raw=gLog[idx];
+      int pipe=StringFind(raw,"|",StringLen(raw)-5);
+      string txt=pipe>=0?StringSubstr(raw,0,pipe):raw;
+      string typ=pipe>=0?StringSubstr(raw,pipe+1):"info";
+      color lc=(typ=="ok")?C_GREEN:(typ=="err")?C_RED:(typ=="warn")?C_ORANGE:C_MUTED;
+      ObjTxt(StringFormat("d_log%d",i),txt);
+      ObjClr(StringFormat("d_log%d",i),lc);
+   }
+
+   ObjTxt("d_ft_time",TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS));
+   ChartRedraw(0);
+}
+//+------------------------------------------------------------------+ 

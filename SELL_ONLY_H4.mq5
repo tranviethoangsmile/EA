@@ -46,10 +46,9 @@ input color  ColorSLBox       = clrRed;
 input color  ColorTPBox       = clrGreen;
 input color  ColorEntryLine   = clrWhite;
 
-// SELL: mở 2 lệnh. Khi giá đạt BreakevenTriggerPct % đường Entry→TP: đóng 1 lệnh, lệnh còn lại
-// dời SL ẩn (BreakevenLockPct % quãng Entry→TP phía dưới entry).
-input double BreakevenTriggerPct = 30.0;
-input double BreakevenLockPct    = 10.0;
+// H4 SELL: khi giá đi được 75% quãng Entry→TP mới kéo SL về entry (BE). BreakevenLockPct=0 → SL = entry.
+input double BreakevenTriggerPct = 75.0;
+input double BreakevenLockPct    = 0.0;
 
 input string EntryMode        = "SELL ONLY"; // OPEN_NEXT_BAR | CLOSE_SIGNAL
 
@@ -513,7 +512,7 @@ void ApplySellBreakevenLock(double progress)
    gTrade.sl = NormalizeDouble(newSL, _Digits);
    gTrade.breakevenDone=true;
    UpdateSLBox();
-   Print("BE+LOCK @ ",DoubleToString(progress,1),"%→TP | SL=",gTrade.sl);
+   Print("BE @ entry @ ",DoubleToString(progress,1),"%→TP | SL=",gTrade.sl);
    TG_OnBreakeven(gTrade.sl, gTrade.entry, progress);
 }
 
