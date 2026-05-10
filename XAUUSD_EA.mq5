@@ -41,15 +41,14 @@ void OnTick()
    double Ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double Bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    
-   //--- buy condition
-   if(Ask - Bid > TakeProfit * Point)
+   //--- analyze candles
+   if(CheckForBuySignal())
      {
       g_BuyPrice = Ask;
       OrderSend(_Symbol, OP_BUY, Lots, Ask, 2, Ask - StopLoss * Point, Ask + TakeProfit * Point, "Buy Order", 123456789, 0, clrGreen);
      }
    
-   //--- sell condition
-   if(Bid - Ask > TakeProfit * Point)
+   if(CheckForSellSignal())
      {
       g_SellPrice = Bid;
       OrderSend(_Symbol, OP_SELL, Lots, Bid, 2, Bid + StopLoss * Point, Bid - TakeProfit * Point, "Sell Order", 123456789, 0, clrRed);
@@ -75,5 +74,23 @@ void OnTick()
            }
         }
      }
+  }
+//+------------------------------------------------------------------+
+//| Check for buy signal                                             |
+//+------------------------------------------------------------------+
+bool CheckForBuySignal()
+  {
+   // Implement your candle analysis logic here
+   // For example, check for a bullish candle pattern
+   return false; // Placeholder
+  }
+//+------------------------------------------------------------------+
+//| Check for sell signal                                            |
+//+------------------------------------------------------------------+
+bool CheckForSellSignal()
+  {
+   // Implement your candle analysis logic here
+   // For example, check for a bearish candle pattern
+   return false; // Placeholder
   }
 //+------------------------------------------------------------------+
