@@ -1,11 +1,14 @@
 //+------------------------------------------------------------------+
 //|                                        AutoSL_H1_XAUUSD.mq5     |
-//|  AutoSL H1 + EMA M5 Canvas Chart + AutoClose + BE+ | Dash v10   |
+//|  AutoSL H1 + EMA M5 Canvas Chart + AutoClose + BE+ | Dash v11   |
+//|  v11: Auto Entry on EMA Cross + Toggle Button                    |
+//|  FIX: cooldown iBarShift, gLastCrossBar, race condition,         |
+//|       off-by-one, TG encode, CleanTicks, StopDistance fallback   |
 //+------------------------------------------------------------------+
 #property copyright   "Custom EA"
-#property version     "10.00"
+#property version     "11.01"
 #property strict
-#property description "AutoSL H1 | EMA M5 Visual Canvas | AutoClose | Breakeven+ | Dashboard | Live Scale"
+#property description "AutoSL H1 | EMA M5 Visual Canvas | AutoClose | Breakeven+ | Dashboard | Auto Entry"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -25,14 +28,39 @@ input bool     InpBEEnabled     = true;
 input double   InpBETrigger     = 10.0;
 input double   InpBELock        = 1.0;
 //--- Auto Close
-input bool     InpAutoClose     = true;
+input bool     InpAutoClose     = false;
 input int      InpCloseMinute   = 45;
 input int      InpCloseWarning  = 5;
 input bool     InpAlertOnClose  = true;
 //--- EMA M5
-input int      InpEMA_Fast      = 8;
+input int      InpEMA_Fast      = 9;
 input int      InpEMA_Mid       = 21;
 input int      InpEMA_Slow      = 200;
+input int      InpCandleAnalysisDays = 3;
+//--- AUTO ENTRY ON EMA CROSS
+input bool     InpAutoEntryDefault = true;
+input double   InpLotSize          = 0.01;
+input double   InpTP_Points        = 2000.0;
+input double   InpSL_Cross_Points  = 0.0;
+input bool     InpEntryAlertCross  = true;
+input int      InpCrossCooldownBars = 2;
+input ulong    InpMagicNumber      = 20260430;
+input bool     InpBlockOppSignal   = true;
+input bool     InpSmartSLTP        = true;
+input int      InpATRPeriod        = 14;
+input double   InpSL_ATR_Mult      = 1.5;
+input double   InpTP_RR            = 2.0;
+input int      InpStructureBars    = 12;
+input double   InpStructureBuffer  = 500.0;
+input double   InpMinSL_Points     = 3000.0;
+input double   InpMaxSL_Points     = 15000.0;
+input bool     InpProtectAESL      = true;
+input int      InpLimitExpireHours = 24;
+//--- Telegram
+input bool     TG_Enable           = false;
+input string   TG_BotToken         = "8670705580:AAGp4brfAAYyqJYgyflhAdiCNt_bDJwLSqI";
+input string   TG_ChatID           = "8163537465";
+input bool     TG_TestOnInit       = false;
 //--- System
 input int      InpBatchDelay    = 50;
 input int      InpRetryCount    = 3;
@@ -44,40 +72,23 @@ input int      InpPanelY        = 28;
 input int      InpMaxLog        = 5;
 
 //======================================================================
-//
-//  ╔══════════════════════════════════════════════════════════════════╗
-//  ║   MASTER SCALE — GIÁ TRỊ MẶC ĐỊNH KHI KHỞI ĐỘNG               ║
-//  ║                                                                  ║
-//  ║   80  = nhỏ gọn                                                 ║
-//  ║   100 = chuẩn (panel ~480px)                                    ║
-//  ║   120 = to hơn 20%  ← khuyến nghị màn HD                      ║
-//  ║   150 = to hơn 50%  ← màn 2K/4K                               ║
-//  ║   200 = gấp đôi                                                 ║
-//  ║                                                                  ║
-//  ║   Hoặc dùng nút  [ S ][ M ][ L ][ XL ]  trên dashboard         ║
-//  ║   để đổi kích thước NGAY TRÊN BIỂU ĐỒ, không cần recompile!   ║
-//  ╚══════════════════════════════════════════════════════════════════╝
-//
-#define DASH_SCALE  100    // ← giá trị compile-time mặc định (bị ghi đè bởi gDashScale)
-
+//  MASTER SCALE
 //======================================================================
-//  SCALING ENGINE — runtime, dùng gDashScale thay DASH_SCALE
-//  → toàn bộ panel rebuild ngay khi click nút S/M/L/XL
-//======================================================================
-#define _SZ(n)   ((int)(((long)(n) * (DASH_SCALE) + 50L) / 100L))   // compile-time (chỉ dùng cho CANVAS_*)
+#define DASH_SCALE  100
+#define _SZ(n)   ((int)(((long)(n) * (DASH_SCALE) + 50L) / 100L))
 #define _FS(n)   (_SZ(n) < 6 ? 6 : _SZ(n))
 
-int gDashScale = DASH_SCALE;   // ← runtime master scale, thay đổi khi click nút
+int gDashScale = DASH_SCALE;
 
-// Tất cả layout dùng sz()/fs() qua gDashScale — rebuild tức thì khi scale thay đổi
 int sz(int n){ return (int)(((long)n * gDashScale + 50L) / 100L); }
 int fs(int n){ int v=(int)(((long)n * gDashScale + 50L) / 100L); return v<6?6:v; }
 
 //======================================================================
-//  CANVAS SIZE  (compile-time, dùng _SZ)
+//  CANVAS SIZE
 //======================================================================
 #define CANVAS_NAME   "d_ema_canvas"
-#define CANVAS_W      _SZ(464)    // = PW(480) - margin_left(8) - margin_right(8) = 464
+#define OVERLAY_PREFIX "d_ov_"
+#define CANVAS_W      _SZ(464)
 #define CANVAS_H      _SZ(160)
 
 //--- Palette
@@ -101,17 +112,13 @@ int fs(int n){ int v=(int)(((long)n * gDashScale + 50L) / 100L); return v<6?6:v;
 #define C_PURPLE    C'165,80,225'
 
 //======================================================================
-//  LAYOUT CONSTANTS — tất cả dùng sz() tại runtime
-//  Định nghĩa tập trung, tránh "magic number" rải rác
+//  LAYOUT CONSTANTS
 //======================================================================
+#define PW_BASE      980
+#define MARGIN_H     8
+#define CARD_GAP     6
+#define SECT_GAP     10
 
-// Kích thước cố định
-#define PW_BASE      480    // panel width base
-#define MARGIN_H     8      // margin ngang (trái/phải nội dung)
-#define CARD_GAP     6      // gap giữa cards
-#define SECT_GAP     10     // gap trước section label
-
-// Chiều cao từng khối (base tại scale=100)
 #define H_HDR        32
 #define H_CRD        62
 #define H_SL         88
@@ -127,15 +134,16 @@ int fs(int n){ int v=(int)(((long)n * gDashScale + 50L) / 100L); return v<6?6:v;
 #define H_EMA_SB     5
 #define H_EMA_PAD    8
 
-// Gaps dọc (base tại scale=100)
-#define GAP_HDR_OV   38     // header → section Overview
-#define GAP_SECT_LBL 12     // chiều cao chữ section label
-#define GAP_CRD_EMA  10     // card → section EMA
-#define GAP_EMA_SL   11     // EMA card → section SL
-#define GAP_SLC      8      // SL card → countdown
-#define GAP_CD_BT    6      // countdown → batch
-#define GAP_BT_LOG   8      // batch → log section
-#define GAP_LOG_FT   12     // log → footer
+#define H_AE_BAR     24
+
+#define GAP_HDR_OV   38
+#define GAP_SECT_LBL 12
+#define GAP_CRD_EMA  10
+#define GAP_EMA_SL   11
+#define GAP_SLC      8
+#define GAP_CD_BT    6
+#define GAP_BT_LOG   8
+#define GAP_LOG_FT   12
 
 //======================================================================
 //  GLOBALS
@@ -143,6 +151,10 @@ int fs(int n){ int v=(int)(((long)n * gDashScale + 50L) / 100L); return v<6?6:v;
 CTrade        trade;
 CPositionInfo posInfo;
 CCanvas       gEmaCanvas;
+
+struct EmaSnap { double f,m,s,fp,mp,sp,price; };
+struct Signal  { string trend,sig,str,reason; color tc,sc; int score; };
+struct EntryPlan { string dir,note; double entry,sl,tp; color clr; bool ready; };
 
 string        gSym          = "";
 bool          gHidden       = false;
@@ -154,10 +166,25 @@ bool          gCanvasReady  = false;
 datetime      gLastM5Bar    = 0;
 
 int           gEmaFast, gEmaMid, gEmaSlow;
+int           gAnalysisDays = 3;
 
 int  statSLOk   = 0, statSLFail  = 0;
 int  statBEOk   = 0;
 int  statClOk   = 0, statClFail  = 0;
+
+bool          gAutoEntry    = false;
+int           statAEOk      = 0;
+int           statAEFail    = 0;
+int           statLimitOk   = 0;
+int           statLimitFail = 0;
+datetime      gLastCrossBar = 0;
+bool          gPrevGolden   = false;
+bool          gPrevDeath    = false;
+string        gLastCrossType= "";
+bool          gManualPlanActive = false;
+datetime      gManualPlanTime   = 0;
+EntryPlan     gManualPlan;
+string        gManualPlanText   = "";
 
 ulong tickSL[];
 ulong tickBE[];
@@ -167,22 +194,15 @@ string gLog[];
 string gObjs[];
 
 int hFast, hMid, hSlow;
+int hATR;
 
 //======================================================================
-//  LAYOUT HELPERS — tập trung tính toán layout tại một chỗ
-//  Mọi hàm BuildPanel/InitCanvas đều gọi các hàm này
+//  LAYOUT HELPERS
 //======================================================================
-
-// Chiều rộng panel runtime
 int PanelW()   { return sz(PW_BASE); }
-
-// Chiều rộng vùng canvas — runtime theo gDashScale
-// CANVAS_W/_H (compile-time _SZ) chỉ dùng cho CreateBitmapLabel lần đầu,
-// CanvasW()/CanvasH() dùng cho mọi tính toán layout và Resize()
-int CanvasW()  { return sz(PW_BASE - MARGIN_H*2); }   // 480 - 16 = 464
+int CanvasW()  { return sz(PW_BASE - MARGIN_H*2); }
 int CanvasH()  { return sz(160); }
 
-// Tổng chiều cao card EMA (tính từ các thành phần)
 int EmaCardH()
 {
    return sz(H_EMA_ACC) + sz(H_EMA_SH) + CanvasH()
@@ -190,21 +210,18 @@ int EmaCardH()
         + sz(H_EMA_SIG) + sz(H_EMA_RSN) + sz(H_EMA_SB) + sz(H_EMA_PAD);
 }
 
-// Y tuyệt đối của vùng bắt đầu canvas bitmap (khớp BuildPanel)
-// Phải giống hệt cách BuildPanel tính ecv_y
 int CalcCanvasScreenY()
 {
    int y = InpPanelY;
-   y += sz(H_HDR);                          // header
-   y += sz(GAP_HDR_OV);                     // gap header → Overview label
-   y += sz(GAP_SECT_LBL);                   // Overview label height
-   y += sz(H_CRD);                          // 4 metric cards
-   y += sz(GAP_CRD_EMA);                    // gap → EMA section
-   y += sz(GAP_SECT_LBL);                   // EMA label height
-   // eby = Y bắt đầu card EMA outer
-   y += sz(H_EMA_ACC);                      // accent bar
-   y += sz(H_EMA_SH);                       // sub-header
-   // ecv_y = y bây giờ = đỉnh canvas
+   y += sz(H_HDR);
+   y += sz(H_AE_BAR);
+   y += sz(GAP_HDR_OV);
+   y += sz(GAP_SECT_LBL);
+   y += sz(H_CRD);
+   y += sz(GAP_CRD_EMA);
+   y += sz(GAP_SECT_LBL);
+   y += sz(H_EMA_ACC);
+   y += sz(H_EMA_SH);
    return y;
 }
 
@@ -216,24 +233,36 @@ int OnInit()
    gSym = (InpSymbol == "") ? Symbol() : InpSymbol;
    if(!SymbolSelect(gSym, true)){ Alert("Symbol not found: " + gSym); return INIT_FAILED; }
 
+   trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(20);
    trade.SetAsyncMode(false);
 
    gEmaFast = InpEMA_Fast;
    gEmaMid  = InpEMA_Mid;
    gEmaSlow = InpEMA_Slow;
+   gAnalysisDays = MathMax(1,InpCandleAnalysisDays);
+
+   gAutoEntry = InpAutoEntryDefault;
 
    if(!ReinitEmaHandles()) return INIT_FAILED;
 
-   Log("EA v10.0 | " + gSym + " | Scale=" + (string)gDashScale + "% | EMA "
+   Log("EA v11.01 | " + gSym + " | Scale=" + (string)gDashScale + "% | EMA "
        + (string)gEmaFast + "/" + (string)gEmaMid + "/" + (string)gEmaSlow, "info");
-   Log(StringFormat("SL buffer=%.0fpt | BE $%.0f>>+$%.0f | Close phut %02d",
+   Log(StringFormat("SL buffer=%.0fpt | BE $%.0f>>+$%.0f | AutoClose theo phut %02d",
        InpExtraPoints, InpBETrigger, InpBELock, InpCloseMinute), "info");
+   Log(StringFormat("AutoEntry=%s | Lot=%.2f | TP=%.0fpt | Cooldown=%d bars",
+       gAutoEntry?"ON":"OFF", InpLotSize, InpTP_Points, InpCrossCooldownBars), "info");
+   Log(StringFormat("SmartSLTP=%s | ATRx%.1f | RR=%.1f | SL %.0f..%.0f pt",
+       InpSmartSLTP?"ON":"OFF", InpSL_ATR_Mult, InpTP_RR, InpMinSL_Points, InpMaxSL_Points), "info");
 
    BuildPanel();
    if(!InitCanvas()) Log("Canvas init failed","err");
+   DrawChartOverlay();
+
+   InitCrossState();
 
    EventSetTimer(InpCheckInterval);
+   TG_OnStart();
    return INIT_SUCCEEDED;
 }
 
@@ -243,7 +272,10 @@ void OnDeinit(const int reason)
    IndicatorRelease(hFast);
    IndicatorRelease(hMid);
    IndicatorRelease(hSlow);
+   IndicatorRelease(hATR);
    if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
+   ObjectDelete(0,CANVAS_NAME);
+   DeleteObjectsByPrefix(OVERLAY_PREFIX);
    ObjDeleteAll();
 }
 
@@ -255,12 +287,29 @@ bool ReinitEmaHandles()
    if(hFast != INVALID_HANDLE && hFast != 0) IndicatorRelease(hFast);
    if(hMid  != INVALID_HANDLE && hMid  != 0) IndicatorRelease(hMid);
    if(hSlow != INVALID_HANDLE && hSlow != 0) IndicatorRelease(hSlow);
+   if(hATR  != INVALID_HANDLE && hATR  != 0) IndicatorRelease(hATR);
    hFast = iMA(gSym, PERIOD_M5, gEmaFast, 0, MODE_EMA, PRICE_CLOSE);
    hMid  = iMA(gSym, PERIOD_M5, gEmaMid,  0, MODE_EMA, PRICE_CLOSE);
    hSlow = iMA(gSym, PERIOD_M5, gEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
-   if(hFast==INVALID_HANDLE || hMid==INVALID_HANDLE || hSlow==INVALID_HANDLE)
+   hATR  = iATR(gSym, PERIOD_M5, InpATRPeriod);
+   if(hFast==INVALID_HANDLE || hMid==INVALID_HANDLE || hSlow==INVALID_HANDLE || hATR==INVALID_HANDLE)
    { Alert("EMA handle error"); return false; }
    return true;
+}
+
+//======================================================================
+//  INIT CROSS STATE
+//  FIX: set gLastCrossBar = bar[1] để tránh trigger ngay khi load
+//======================================================================
+void InitCrossState()
+{
+   double f[], m[];
+   ArraySetAsSeries(f, true); ArraySetAsSeries(m, true);
+   if(CopyBuffer(hFast,0,0,3,f)<3 || CopyBuffer(hMid,0,0,3,m)<3) return;
+   gPrevGolden  = (f[1] > m[1]);
+   gPrevDeath   = (f[1] < m[1]);
+   // FIX: gán gLastCrossBar = bar[1] để cooldown check hoạt động đúng ngay từ đầu
+   gLastCrossBar = iTime(gSym, PERIOD_M5, 1);
 }
 
 //======================================================================
@@ -269,86 +318,51 @@ bool ReinitEmaHandles()
 bool InitCanvas()
 {
    if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
-
-   // Canvas đặt tại px + sz(MARGIN_H), khớp với viền d_ema_cvbrd trong BuildPanel
-   int cx = InpPanelX + sz(MARGIN_H);
-   int cy = CalcCanvasScreenY();
-   int cw = CanvasW();
-   int ch = CanvasH();
-
-   if(!gEmaCanvas.CreateBitmapLabel(0, 0, CANVAS_NAME, cx, cy, cw, ch, COLOR_FORMAT_ARGB_NORMALIZE))
-      return false;
-
-   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_BACK,       false);
-   ObjectSetInteger(0, CANVAS_NAME, OBJPROP_ZORDER,     5);
-   Track(CANVAS_NAME);
-   gCanvasReady = true;
-   DrawEmaCanvas();
+   ObjectDelete(0,CANVAS_NAME);
    return true;
 }
 
 void DrawEmaCanvas()
 {
    if(!gCanvasReady) return;
-
    int W = CanvasW();
    int H = CanvasH();
    int bars = MathMax(40, sz(75));
-
    double ef[], em[], es[];
    ArraySetAsSeries(ef,true); ArraySetAsSeries(em,true); ArraySetAsSeries(es,true);
    if(CopyBuffer(hFast,0,0,bars,ef)<bars) return;
    if(CopyBuffer(hMid, 0,0,bars,em)<bars) return;
    if(CopyBuffer(hSlow,0,0,bars,es)<bars) return;
-
    double mn=DBL_MAX, mx=-DBL_MAX;
-   for(int i=0;i<bars;i++)
-   {
-      mn = MathMin(mn, MathMin(ef[i], MathMin(em[i], es[i])));
-      mx = MathMax(mx, MathMax(ef[i], MathMax(em[i], es[i])));
+   for(int i=0;i<bars;i++){
+      mn=MathMin(mn,MathMin(ef[i],MathMin(em[i],es[i])));
+      mx=MathMax(mx,MathMax(ef[i],MathMax(em[i],es[i])));
    }
-   double range = mx - mn;
-   if(range <= 0) return;
-   double pad = range * 0.10;
-   mn -= pad; mx += pad; range = mx - mn;
-
-   const int PL=4, PR=4, PT=5, PB=5;
-   int cW = W - PL - PR;
-   int cH = H - PT - PB;
-   double barW = (double)cW / bars;
-
-   // Resize canvas nếu kích thước thay đổi (do reinit)
-   if(gEmaCanvas.Width() != W || gEmaCanvas.Height() != H)
-   {
-      gEmaCanvas.Resize(W, H);
-   }
-
+   double range=mx-mn;
+   if(range<=0) return;
+   double pad=range*0.10;
+   mn-=pad; mx+=pad; range=mx-mn;
+   const int PL=4,PR=4,PT=5,PB=5;
+   int cW=W-PL-PR, cH=H-PT-PB;
+   int plotW=(int)(cW*0.66);
+   int plotX0=PL;
+   int plotX1=plotX0+plotW;
+   double barW=(bars>1)?(double)plotW/(bars-1):0.0;
+   if(gEmaCanvas.Width()!=W||gEmaCanvas.Height()!=H) gEmaCanvas.Resize(W,H);
    gEmaCanvas.Erase(ColorToARGB(C'5,9,17',255));
-
-   uint gridC = ColorToARGB(C'22,30,50',255);
-   for(int g=1;g<=3;g++)
-   {
-      int gy = PT + g*cH/4;
-      for(int x=PL; x<W-PR; x+=5)
-         gEmaCanvas.PixelSet(x, gy, gridC);
+   uint gridC=ColorToARGB(C'22,30,50',255);
+   for(int g=1;g<=3;g++){
+      int gy=PT+g*cH/4;
+      for(int x=plotX0;x<=plotX1;x+=5) gEmaCanvas.PixelSet(x,gy,gridC);
    }
-   for(int vb=10; vb<bars; vb+=10)
-   {
-      int gx = PL + (int)((bars-vb)*barW + barW*0.5);
-      for(int y=PT; y<H-PB; y+=5)
-         gEmaCanvas.PixelSet(gx, y, gridC);
+   for(int vb=10;vb<bars;vb+=10){
+      int gx=plotX0+(int)((bars-1-vb)*barW);
+      for(int y=PT;y<H-PB;y+=5) gEmaCanvas.PixelSet(gx,y,gridC);
    }
-
-   uint cF = ColorToARGB(C_YELLOW, 230);
-   uint cM = ColorToARGB(C_CYAN,   220);
-   uint cS = ColorToARGB(C_ORANGE, 200);
-
-   for(int i=bars-2; i>=0; i--)
-   {
-      int bi0=bars-1-(i+1), bi1=bars-1-i;
-      int xa=PL+(int)(bi0*barW+barW*0.5), xb=PL+(int)(bi1*barW+barW*0.5);
+   uint cF=ColorToARGB(C_YELLOW,230),cM=ColorToARGB(C_CYAN,220),cS=ColorToARGB(C_ORANGE,200);
+   for(int i=bars-2;i>=0;i--){
+      int bi0=bars-2-i,bi1=bars-1-i;
+      int xa=plotX0+(int)(bi0*barW),xb=plotX0+(int)(bi1*barW);
       int yS0=MathMax(PT,MathMin(H-PB,PT+(int)((mx-es[i+1])/range*cH)));
       int yS1=MathMax(PT,MathMin(H-PB,PT+(int)((mx-es[i])  /range*cH)));
       int yM0=MathMax(PT,MathMin(H-PB,PT+(int)((mx-em[i+1])/range*cH)));
@@ -359,64 +373,257 @@ void DrawEmaCanvas()
       gEmaCanvas.Line(xa,yM0,xb,yM1,cM);
       gEmaCanvas.Line(xa,yF0,xb,yF1,cF);
    }
-
-   for(int i=bars-2; i>=1; i--)
-   {
-      bool wasBelowMid=(ef[i+1]<=em[i+1]), nowAboveMid=(ef[i]>em[i]);
-      bool wasAboveMid=(ef[i+1]>=em[i+1]), nowBelowMid=(ef[i]<em[i]);
-      bool goldenCross=wasBelowMid&&nowAboveMid, deathCross=wasAboveMid&&nowBelowMid;
+   int crossLabelCount=0;
+   int maxCrossLabels=4;
+   int recentBarsForLabel=24;
+   int labelFont=MathMax(10,MathMin(15,fs(9)));
+   for(int i=bars-2;i>=1;i--){
+      bool wasBelowMid=(ef[i+1]<=em[i+1]),nowAboveMid=(ef[i]>em[i]);
+      bool wasAboveMid=(ef[i+1]>=em[i+1]),nowBelowMid=(ef[i]<em[i]);
+      bool goldenCross=wasBelowMid&&nowAboveMid,deathCross=wasAboveMid&&nowBelowMid;
       if(!goldenCross&&!deathCross) continue;
-
       int bi=bars-1-i;
-      int xDot=PL+(int)(bi*barW+barW*0.5);
+      int xDot=plotX0+(int)(bi*barW);
       double midPrice=(ef[i]+em[i])*0.5;
       int yDot=MathMax(PT+6,MathMin(H-PB-6,PT+(int)((mx-midPrice)/range*cH)));
-
       uint dotC=goldenCross?ColorToARGB(C_GREEN,245):ColorToARGB(C_RED,245);
       gEmaCanvas.FillCircle(xDot,yDot,5,dotC);
       gEmaCanvas.Circle(xDot,yDot,5,ColorToARGB(C'210,218,238',200));
-
+      bool showLabel=(i<=recentBarsForLabel && crossLabelCount<maxCrossLabels);
+      if(!showLabel) continue;
+      crossLabelCount++;
       string priceStr=DoubleToString(midPrice,2);
       uint lblC=goldenCross?ColorToARGB(C_GREEN,255):ColorToARGB(C_RED,255);
-      int lblH=12, yLbl=goldenCross?yDot-5-2-lblH:yDot+5+2;
+      int lblH=labelFont+6;
+      int yLbl=goldenCross?yDot-5-3-lblH:yDot+5+3;
       yLbl=MathMax(PT,MathMin(H-PB-lblH,yLbl));
-      int lblW=(int)StringLen(priceStr)*8;
-      int xLbl=MathMax(PL,MathMin(W-PR-lblW,xDot-lblW/2));
-      gEmaCanvas.FillRectangle(xLbl-3,yLbl-1,xLbl+lblW+2,yLbl+lblH+1,ColorToARGB(C'5,9,17',210));
-      gEmaCanvas.FontSet("Arial Bold",15);
-      gEmaCanvas.TextOut(xLbl,yLbl,priceStr,lblC);
+      int lblW=(int)(StringLen(priceStr)*(labelFont*0.66));
+      int xLbl=MathMax(plotX0,MathMin(plotX1-lblW,xDot-lblW/2));
+      gEmaCanvas.FillRectangle(xLbl-4,yLbl-2,xLbl+lblW+4,yLbl+lblH+2,ColorToARGB(C'5,9,17',235));
+      gEmaCanvas.Rectangle(xLbl-4,yLbl-2,xLbl+lblW+4,yLbl+lblH+2,ColorToARGB(C'210,218,238',120));
+      gEmaCanvas.FontSet("Arial Bold",labelFont);
+      gEmaCanvas.TextOut(xLbl,yLbl+1,priceStr,lblC);
    }
-
    double cp=SymbolInfoDouble(gSym,SYMBOL_BID);
    int yP=MathMax(PT,MathMin(H-PB,PT+(int)((mx-cp)/range*cH)));
-   for(int x=PL;x<W-PR;x+=6)
-   {
+   for(int x=plotX0;x<=plotX1;x+=6){
       gEmaCanvas.PixelSet(x,  yP,ColorToARGB(C'160,168,195',160));
       gEmaCanvas.PixelSet(x+1,yP,ColorToARGB(C'160,168,195',160));
    }
-
-   // Legend dots phía góc phải
    gEmaCanvas.FillCircle(W-52,PT+5,3,ColorToARGB(C_YELLOW,230));
    gEmaCanvas.FillCircle(W-36,PT+5,3,ColorToARGB(C_CYAN,  220));
    gEmaCanvas.FillCircle(W-20,PT+5,3,ColorToARGB(C_ORANGE,210));
    gEmaCanvas.Update();
 }
 
+void DeleteObjectsByPrefix(const string prefix)
+{
+   for(int i=ObjectsTotal(0,0,-1)-1;i>=0;i--)
+   {
+      string n=ObjectName(0,i,0,-1);
+      if(StringFind(n,prefix)==0) ObjectDelete(0,n);
+   }
+}
+
+void UpsertTrend(const string n,datetime t1,double p1,datetime t2,double p2,color clr,int width)
+{
+   if(ObjectFind(0,n)<0)
+      ObjectCreate(0,n,OBJ_TREND,0,t1,p1,t2,p2);
+   else
+   {
+      ObjectMove(0,n,0,t1,p1);
+      ObjectMove(0,n,1,t2,p2);
+   }
+   ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_WIDTH,width);
+   ObjectSetInteger(0,n,OBJPROP_STYLE,STYLE_SOLID);
+   ObjectSetInteger(0,n,OBJPROP_RAY_RIGHT,false);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,n,OBJPROP_BACK,false);
+}
+
+void UpsertHLine(const string n,double price,color clr,int width,int style)
+{
+   if(ObjectFind(0,n)<0)
+      ObjectCreate(0,n,OBJ_HLINE,0,0,price);
+   else
+      ObjectSetDouble(0,n,OBJPROP_PRICE,price);
+   ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_WIDTH,width);
+   ObjectSetInteger(0,n,OBJPROP_STYLE,style);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,n,OBJPROP_BACK,false);
+}
+
+void UpsertText(const string n,datetime t,double price,string txt,color clr,int fsize)
+{
+   if(ObjectFind(0,n)<0)
+      ObjectCreate(0,n,OBJ_TEXT,0,t,price);
+   else
+      ObjectMove(0,n,0,t,price);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt);
+   ObjectSetString(0,n,OBJPROP_FONT,"Arial Bold");
+   ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fsize);
+   ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,n,OBJPROP_BACK,false);
+}
+
+void UpsertArrow(const string n,datetime t,double price,color clr,int width,int code)
+{
+   if(ObjectFind(0,n)<0)
+      ObjectCreate(0,n,OBJ_ARROW,0,t,price);
+   else
+      ObjectMove(0,n,0,t,price);
+   ObjectSetInteger(0,n,OBJPROP_ARROWCODE,code);
+   ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_WIDTH,width);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,n,OBJPROP_BACK,false);
+}
+
+void UpsertPriceBox(const string n,datetime t1,double p1,datetime t2,double p2,color bg,color bd)
+{
+   double top=MathMax(p1,p2);
+   double bot=MathMin(p1,p2);
+   if(ObjectFind(0,n)<0)
+      ObjectCreate(0,n,OBJ_RECTANGLE,0,t1,top,t2,bot);
+   else
+   {
+      ObjectMove(0,n,0,t1,top);
+      ObjectMove(0,n,1,t2,bot);
+   }
+   ObjectSetInteger(0,n,OBJPROP_BGCOLOR,bg);
+   ObjectSetInteger(0,n,OBJPROP_COLOR,bd);
+   ObjectSetInteger(0,n,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,n,OBJPROP_STYLE,STYLE_SOLID);
+   ObjectSetInteger(0,n,OBJPROP_FILL,true);
+   ObjectSetInteger(0,n,OBJPROP_BACK,false);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+}
+
+void DrawChartOverlay()
+{
+   int bars=MathMin(120,Bars(gSym,PERIOD_M5));
+   if(bars<3) return;
+   double ef[],em[],es[];
+   datetime tm[];
+   ArraySetAsSeries(ef,true); ArraySetAsSeries(em,true); ArraySetAsSeries(es,true); ArraySetAsSeries(tm,true);
+   if(CopyBuffer(hFast,0,0,bars,ef)<bars) return;
+   if(CopyBuffer(hMid, 0,0,bars,em)<bars) return;
+   if(CopyBuffer(hSlow,0,0,bars,es)<bars) return;
+   if(CopyTime(gSym,PERIOD_M5,0,bars,tm)<bars) return;
+
+   for(int i=bars-2;i>=0;i--)
+   {
+      datetime t1=tm[i+1], t2=tm[i];
+      UpsertTrend(OVERLAY_PREFIX+"ema_f_"+(string)i,t1,ef[i+1],t2,ef[i],C_YELLOW,2);
+      UpsertTrend(OVERLAY_PREFIX+"ema_m_"+(string)i,t1,em[i+1],t2,em[i],C_CYAN,2);
+      UpsertTrend(OVERLAY_PREFIX+"ema_s_"+(string)i,t1,es[i+1],t2,es[i],C_ORANGE,1);
+   }
+
+   datetime labelTime=tm[0]+PeriodSeconds(PERIOD_M5)*3;
+   int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   UpsertText(OVERLAY_PREFIX+"lbl_f",labelTime,ef[0],"EMA "+(string)gEmaFast+" "+DoubleToString(ef[0],dg),C_YELLOW,8);
+   UpsertText(OVERLAY_PREFIX+"lbl_m",labelTime,em[0],"EMA "+(string)gEmaMid+" "+DoubleToString(em[0],dg),C_CYAN,8);
+   UpsertText(OVERLAY_PREFIX+"lbl_s",labelTime,es[0],"EMA "+(string)gEmaSlow+" "+DoubleToString(es[0],dg),C_ORANGE,8);
+
+   int crossCount=0;
+   for(int i=1;i<MathMin(bars-1,80) && crossCount<6;i++)
+   {
+      bool golden=(ef[i]>em[i] && ef[i+1]<=em[i+1]);
+      bool death =(ef[i]<em[i] && ef[i+1]>=em[i+1]);
+      if(!golden && !death) continue;
+      double p=(ef[i]+em[i])*0.5;
+      color cc=golden?C_GREEN:C_RED;
+      string dir=golden?"BUY":"SELL";
+      string id=OVERLAY_PREFIX+"cross_"+IntegerToString((long)tm[i]);
+      UpsertArrow(id+"_dot",tm[i],p,cc,2,159);
+      UpsertText(id+"_txt",tm[i]+PeriodSeconds(PERIOD_M5),p,dir+" "+DoubleToString(p,dg),cc,8);
+      crossCount++;
+   }
+
+   EmaSnap ema;
+   if(!GetEMA(ema)) return;
+   EntryPlan plan=gManualPlan;
+   if(!gManualPlanActive)
+   {
+      DeleteObjectsByPrefix(OVERLAY_PREFIX+"plan_");
+      return;
+   }
+   if(plan.ready)
+   {
+      string prefix=OVERLAY_PREFIX+"plan_";
+      UpsertHLine(prefix+"entry",plan.entry,plan.clr,2,STYLE_DASH);
+      if(plan.sl>0) UpsertHLine(prefix+"sl",plan.sl,C_RED,1,STYLE_DOT);
+      if(plan.tp>0) UpsertHLine(prefix+"tp",plan.tp,C_GREEN,1,STYLE_DOT);
+      datetime pointTime=(gManualPlanActive && gManualPlanTime>0) ? gManualPlanTime : tm[0];
+      UpsertArrow(prefix+"entry_dot",pointTime,plan.entry,plan.clr,3,159);
+      if(plan.sl>0) UpsertArrow(prefix+"sl_dot",pointTime,plan.sl,C_RED,2,159);
+      if(plan.tp>0) UpsertArrow(prefix+"tp_dot",pointTime,plan.tp,C_GREEN,2,159);
+      string txt=StringFormat("%s entry %.2f | SL %.2f | TP %.2f",plan.dir,plan.entry,plan.sl,plan.tp);
+      UpsertText(prefix+"label",labelTime,plan.entry,txt,plan.clr,9);
+      if(gManualPlanActive)
+      {
+         bool isBuy=(plan.dir=="BUY");
+         int arrowCode=isBuy?233:234;
+         UpsertArrow(prefix+"ideal_arrow",pointTime,plan.entry,plan.clr,4,arrowCode);
+         double atr=ATR_M5();
+         double risk=MathMax(MathAbs(plan.entry-plan.sl),MathAbs(plan.tp-plan.entry));
+         risk=MathMax(risk,atr>0?atr:SymbolInfoDouble(gSym,SYMBOL_POINT)*InpMinSL_Points);
+         double boxH=risk*0.34;
+         double center=isBuy ? plan.entry+boxH*1.35 : plan.entry-boxH*1.35;
+         datetime boxT1=pointTime+PeriodSeconds(PERIOD_M5);
+         datetime boxT2=pointTime+PeriodSeconds(PERIOD_M5)*22;
+         color boxBg=isBuy?C'8,38,23':C'45,14,14';
+         UpsertPriceBox(prefix+"ideal_cloud",boxT1,center+boxH,boxT2,center-boxH,boxBg,plan.clr);
+         datetime textT=boxT1+PeriodSeconds(PERIOD_M5);
+         UpsertText(prefix+"ideal_t1",textT,center+boxH*0.48,"IDEAL "+plan.dir,plan.clr,10);
+         UpsertText(prefix+"ideal_t2",textT,center+boxH*0.10,"ENTRY "+DoubleToString(plan.entry,dg),C_WHITE,8);
+         UpsertText(prefix+"ideal_t3",textT,center-boxH*0.28,"SL "+DoubleToString(plan.sl,dg)+" | TP "+DoubleToString(plan.tp,dg),C_WHITE,8);
+         UpsertText(prefix+"note",labelTime,plan.tp>0?plan.tp:plan.entry,gManualPlanText,plan.clr,8);
+      }
+      else
+      {
+         DeleteObjectsByPrefix(prefix+"ideal_");
+      }
+   }
+   else
+   {
+      DeleteObjectsByPrefix(OVERLAY_PREFIX+"plan_");
+   }
+}
+
 //======================================================================
 //  EVENT HANDLERS
 //======================================================================
-void OnTick()  { PanelUpdate(); }
+void OnTick()
+{
+   DrawChartOverlay();
+   PanelUpdate();
+}
 
+//======================================================================
+//  FIX: Race condition — lưu trạng thái gBatchRunning TRƯỚC khi chạy
+//  DoSetSL/BE/Close, rồi chỉ gọi CheckEMACross nếu không bận trước đó.
+//======================================================================
 void OnTimer()
 {
-   if(!gBatchRunning)
-   {
-      DoSetSL();
-      if(InpBEEnabled) DoBreakeven();
-      if(InpAutoClose) DoAutoClose();
-   }
+   bool wasBusy = gBatchRunning;
+
+   DoSetSL();
+   if(InpBEEnabled) DoBreakeven();
+   if(InpAutoClose) DoAutoClose();
+
    datetime curBar = iTime(gSym, PERIOD_M5, 0);
-   if(curBar != gLastM5Bar){ gLastM5Bar = curBar; DrawEmaCanvas(); }
+   if(curBar != gLastM5Bar)
+   {
+      gLastM5Bar = curBar;
+      DrawEmaCanvas();
+      DrawChartOverlay();
+      // Chỉ check cross nếu không có batch nào đang chạy tại thời điểm timer bắt đầu
+      if(gAutoEntry && !wasBusy) CheckEMACross();
+   }
    PanelUpdate();
 }
 
@@ -424,72 +631,130 @@ void OnTradeTransaction(const MqlTradeTransaction& t,
                         const MqlTradeRequest& r,
                         const MqlTradeResult& s)
 {
-   if(t.type == TRADE_TRANSACTION_DEAL_ADD && !gBatchRunning){ Sleep(300); DoSetSL(); }
+   if(t.type==TRADE_TRANSACTION_DEAL_ADD&&!gBatchRunning){ Sleep(300); DoSetSL(); }
 }
 
 void OnChartEvent(const int id,const long& lp,const double& dp,const string& sp)
 {
    if(id != CHARTEVENT_OBJECT_CLICK) return;
 
-   //--------------------------------------------------------------------
-   //  HIDE / SHOW
-   //--------------------------------------------------------------------
-   if(sp == "d_btn_hide")
-   {
-      gHidden = !gHidden;
+   if(sp=="d_btn_hide" || sp=="d_btn_hide_bg"){
+      gHidden=!gHidden;
       PanelToggle();
-      ObjTxt("d_btn_hide", gHidden ? "[ SHOW ]" : "[ X ]");
+      ObjTxt("d_btn_hide",gHidden?"[ SHOW ]":"[ X ]");
       if(gCanvasReady)
          ObjectSetInteger(0,CANVAS_NAME,OBJPROP_TIMEFRAMES,gHidden?OBJ_NO_PERIODS:OBJ_ALL_PERIODS);
-      ChartRedraw(0);
-      return;
+      ChartRedraw(0); return;
    }
 
-   //--------------------------------------------------------------------
-   //  SCALE BUTTONS  — S / M / L / XL
-   //  Rebuild toàn bộ panel + canvas ngay lập tức
-   //--------------------------------------------------------------------
-   int newScale = 0;
-   if(sp == "d_btn_sc_s" ) newScale = 80;
-   if(sp == "d_btn_sc_m" ) newScale = 100;
-   if(sp == "d_btn_sc_l" ) newScale = 120;
-   if(sp == "d_btn_sc_xl") newScale = 150;
+   if(sp=="d_btn_ae" || sp=="d_btn_ae_bg"){
+      gAutoEntry=!gAutoEntry;
+      Log(StringFormat("AutoEntry: %s",gAutoEntry?"BẬT":"TẮT"),"info");
+      UpdateAutoEntryBtn();
+      ChartRedraw(0); return;
+   }
 
-   if(newScale > 0 && newScale != gDashScale)
-   {
-      gDashScale = newScale;
-      Log(StringFormat("Scale → %d%%", gDashScale), "info");
-      // Rebuild toàn bộ panel + canvas với scale mới
+   if(sp=="d_btn_candle" || sp=="d_btn_candle_bg"){
+      string detail="";
+      if(AnalyzeCandlesOnDemand(gManualPlan,detail))
+      {
+         gManualPlanActive=true;
+         gManualPlanTime=TimeCurrent();
+         gManualPlanText=detail;
+         ObjTxt("d_btn_candle","ANALYZED");
+         ObjClr("d_btn_candle",C_GREEN);
+         ObjectSetInteger(0,"d_btn_candle_bg",OBJPROP_BGCOLOR,C'12,36,22');
+         ObjectSetInteger(0,"d_btn_candle_bg",OBJPROP_COLOR,C_GREEN);
+         Log("Candle analysis: "+detail,"info");
+      }
+      else
+      {
+         gManualPlanActive=false;
+         gManualPlanTime=TimeCurrent();
+         gManualPlanText=(detail=="" ? "Candle analysis: no clean setup" : detail);
+         ObjTxt("d_btn_candle","NO SETUP");
+         ObjClr("d_btn_candle",C_ORANGE);
+         ObjectSetInteger(0,"d_btn_candle_bg",OBJPROP_BGCOLOR,C'38,24,8');
+         ObjectSetInteger(0,"d_btn_candle_bg",OBJPROP_COLOR,C_ORANGE);
+         Log(gManualPlanText,"warn");
+      }
+      DrawChartOverlay();
+      PanelUpdate();
+      ChartRedraw(0); return;
+   }
+
+   if(sp=="d_btn_limit" || sp=="d_btn_limit_bg"){
+      string detail="";
+      bool ok=AnalyzeAndPlaceLimit(detail);
+      ObjTxt("d_btn_limit",ok?"LIMIT OK":"NO LIMIT");
+      ObjClr("d_btn_limit",ok?C_GREEN:C_ORANGE);
+      ObjectSetInteger(0,"d_btn_limit_bg",OBJPROP_BGCOLOR,ok?C'12,36,22':C'38,24,8');
+      ObjectSetInteger(0,"d_btn_limit_bg",OBJPROP_COLOR,ok?C_GREEN:C_ORANGE);
+      Log(detail,ok?"ok":"warn");
+      DrawChartOverlay();
+      PanelUpdate();
+      ChartRedraw(0); return;
+   }
+
+   int newScale=0;
+   if(sp=="d_btn_sc_s" ) newScale=80;
+   if(sp=="d_btn_sc_m" ) newScale=100;
+   if(sp=="d_btn_sc_l" ) newScale=120;
+   if(sp=="d_btn_sc_xl") newScale=150;
+   if(newScale>0&&newScale!=gDashScale){
+      gDashScale=newScale;
+      Log(StringFormat("Scale → %d%%",gDashScale),"info");
       BuildPanel();
-      if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady = false; }
+      if(gCanvasReady){ gEmaCanvas.Destroy(); gCanvasReady=false; }
       if(!InitCanvas()) Log("Canvas init failed after scale change","err");
       DrawEmaCanvas();
-      ChartRedraw(0);
-      return;
+      DrawChartOverlay();
+      ChartRedraw(0); return;
    }
 
-   //--------------------------------------------------------------------
-   //  EMA PERIOD BUTTONS
-   //--------------------------------------------------------------------
-   bool changed = false;
-   if(sp=="d_btn_f_dec"){ if(gEmaFast>2){ gEmaFast-=1; if(gEmaFast>=gEmaMid) gEmaFast=gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; } }
-   if(sp=="d_btn_f_inc"){ gEmaFast+=1; if(gEmaFast>=gEmaMid) gEmaFast=gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; }
-   if(sp=="d_btn_m_dec"){ if(gEmaMid>gEmaFast+1){ gEmaMid-=1; if(gEmaMid<=gEmaFast)gEmaMid=gEmaFast+1; changed=true; } }
-   if(sp=="d_btn_m_inc"){ gEmaMid+=1; if(gEmaMid>=gEmaSlow)gEmaMid=gEmaSlow-1; if(gEmaMid<=gEmaFast)gEmaMid=gEmaFast+1; changed=true; }
-   if(sp=="d_btn_s_dec"){ if(gEmaSlow>gEmaMid+1){ gEmaSlow-=1; changed=true; } }
-   if(sp=="d_btn_s_inc"){ gEmaSlow+=1; changed=true; }
-
-   if(changed)
+   bool changed=false;
+   if(sp=="d_btn_d_dec" || sp=="d_btn_d_dec_bg")
    {
+      if(gAnalysisDays>1) gAnalysisDays--;
+      gManualPlanActive=false; gManualPlanTime=0; gManualPlanText="";
+      ObjTxt("d_days_val",(string)gAnalysisDays+"D");
+      ObjTxt("d_btn_candle","ANALYZE "+(string)gAnalysisDays+"D");
+      Log(StringFormat("M5 analysis days changed: %dD",gAnalysisDays),"info");
+      DrawChartOverlay();
+      PanelUpdate();
+      ChartRedraw(0); return;
+   }
+   if(sp=="d_btn_d_inc" || sp=="d_btn_d_inc_bg")
+   {
+      gAnalysisDays++;
+      gManualPlanActive=false; gManualPlanTime=0; gManualPlanText="";
+      ObjTxt("d_days_val",(string)gAnalysisDays+"D");
+      ObjTxt("d_btn_candle","ANALYZE "+(string)gAnalysisDays+"D");
+      Log(StringFormat("M5 analysis days changed: %dD",gAnalysisDays),"info");
+      DrawChartOverlay();
+      PanelUpdate();
+      ChartRedraw(0); return;
+   }
+
+   if(sp=="d_btn_f_dec" || sp=="d_btn_f_dec_bg"){ if(gEmaFast>2){ gEmaFast-=1; if(gEmaFast>=gEmaMid)gEmaFast=gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; } }
+   if(sp=="d_btn_f_inc" || sp=="d_btn_f_inc_bg"){ gEmaFast+=1; if(gEmaFast>=gEmaMid)gEmaFast=gEmaMid-1; if(gEmaFast<2)gEmaFast=2; changed=true; }
+   if(sp=="d_btn_m_dec" || sp=="d_btn_m_dec_bg"){ if(gEmaMid>gEmaFast+1){ gEmaMid-=1; if(gEmaMid<=gEmaFast)gEmaMid=gEmaFast+1; changed=true; } }
+   if(sp=="d_btn_m_inc" || sp=="d_btn_m_inc_bg"){ gEmaMid+=1; if(gEmaMid>=gEmaSlow)gEmaMid=gEmaSlow-1; if(gEmaMid<=gEmaFast)gEmaMid=gEmaFast+1; changed=true; }
+   if(sp=="d_btn_s_dec" || sp=="d_btn_s_dec_bg"){ if(gEmaSlow>gEmaMid+1){ gEmaSlow-=1; changed=true; } }
+   if(sp=="d_btn_s_inc" || sp=="d_btn_s_inc_bg"){ gEmaSlow+=1; changed=true; }
+   if(changed){
+      gManualPlanActive=false; gManualPlanTime=0; gManualPlanText="";
       ReinitEmaHandles();
       ObjTxt("d_ema_fval",(string)gEmaFast);
       ObjTxt("d_ema_mval",(string)gEmaMid);
       ObjTxt("d_ema_sval",(string)gEmaSlow);
-      ObjTxt("d_s_ema",StringFormat("EMA ANALYSIS  —  M5  ( %d / %d / %d )",gEmaFast,gEmaMid,gEmaSlow));
+      ObjTxt("d_s_ema",StringFormat("EMA M5  (%d / %d / %d)",gEmaFast,gEmaMid,gEmaSlow));
       ObjTxt("d_ema_shl",StringFormat("M5  %d / %d / %d",gEmaFast,gEmaMid,gEmaSlow));
       Log(StringFormat("EMA changed: %d/%d/%d",gEmaFast,gEmaMid,gEmaSlow),"info");
+      DeleteObjectsByPrefix(OVERLAY_PREFIX+"cross_");
       Sleep(300);
       DrawEmaCanvas();
+      DrawChartOverlay();
       ChartRedraw(0);
    }
 }
@@ -497,12 +762,240 @@ void OnChartEvent(const int id,const long& lp,const double& dp,const string& sp)
 //======================================================================
 //  HELPERS
 //======================================================================
-double H1High() { double a[]; ArraySetAsSeries(a,true); if(CopyHigh(gSym,PERIOD_H1,0,1,a)<1) return 0; return a[0]; }
-double H1Low()  { double a[]; ArraySetAsSeries(a,true); if(CopyLow( gSym,PERIOD_H1,0,1,a)<1) return 0; return a[0]; }
-int    CntPos() { int c=0; for(int i=0;i<PositionsTotal();i++) if(posInfo.SelectByIndex(i)&&posInfo.Symbol()==gSym) c++; return c; }
-int    MnLeft() { MqlDateTime d; TimeToStruct(TimeCurrent(),d); int v=InpCloseMinute-d.min; if(v<0)v+=60; return v; }
-double TotPnL() { double p=0; for(int i=0;i<PositionsTotal();i++) if(posInfo.SelectByIndex(i)&&posInfo.Symbol()==gSym) p+=posInfo.Profit()+posInfo.Swap()+posInfo.Commission(); return p; }
+double H1High(){ double a[]; ArraySetAsSeries(a,true); if(CopyHigh(gSym,PERIOD_H1,0,1,a)<1) return 0; return a[0]; }
+double H1Low() { double a[]; ArraySetAsSeries(a,true); if(CopyLow( gSym,PERIOD_H1,0,1,a)<1) return 0; return a[0]; }
+double M5High(){ double a[]; ArraySetAsSeries(a,true); if(CopyHigh(gSym,PERIOD_M5,0,1,a)<1) return 0; return a[0]; }
+double M5Low() { double a[]; ArraySetAsSeries(a,true); if(CopyLow( gSym,PERIOD_M5,0,1,a)<1) return 0; return a[0]; }
+int    CntPos(){ int c=0; for(int i=0;i<PositionsTotal();i++) if(posInfo.SelectByIndex(i)&&posInfo.Symbol()==gSym) c++; return c; }
+int    MnLeft(){ MqlDateTime d; TimeToStruct(TimeCurrent(),d); int v=InpCloseMinute-d.min; if(v<0)v+=60; return v; }
+double TotPnL(){ double p=0; for(int i=0;i<PositionsTotal();i++) if(posInfo.SelectByIndex(i)&&posInfo.Symbol()==gSym) p+=posInfo.Profit()+posInfo.Swap()+posInfo.Commission(); return p; }
 double USD2Pt(double usd,double lot){ if(lot<=0)return 0; double tv=SymbolInfoDouble(gSym,SYMBOL_TRADE_TICK_VALUE),ts=SymbolInfoDouble(gSym,SYMBOL_TRADE_TICK_SIZE); if(tv<=0||ts<=0)return 0; return usd*ts/(tv*lot); }
+bool IsAEPosition()
+{
+   string cmt=PositionGetString(POSITION_COMMENT);
+   return (StringFind(cmt,"AE ")==0);
+}
+
+double M5StructLow(int bars)
+{
+   double a[]; ArraySetAsSeries(a,true);
+   int n=MathMax(2,bars);
+   if(CopyLow(gSym,PERIOD_M5,1,n,a)<n) return 0;
+   double v=a[0];
+   for(int i=1;i<n;i++) v=MathMin(v,a[i]);
+   return v;
+}
+
+double M5StructHigh(int bars)
+{
+   double a[]; ArraySetAsSeries(a,true);
+   int n=MathMax(2,bars);
+   if(CopyHigh(gSym,PERIOD_M5,1,n,a)<n) return 0;
+   double v=a[0];
+   for(int i=1;i<n;i++) v=MathMax(v,a[i]);
+   return v;
+}
+
+double ATR_M5()
+{
+   double a[]; ArraySetAsSeries(a,true);
+   if(CopyBuffer(hATR,0,1,1,a)<1) return 0;
+   return a[0];
+}
+
+//======================================================================
+//  FIX: EnforceStopDistance — fallback minDist thực tế hơn khi STOPS_LEVEL=0
+//======================================================================
+void EnforceStopDistance(const int dir,const double entry,double& sl,double& tp)
+{
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   double minDist=(double)SymbolInfoInteger(gSym,SYMBOL_TRADE_STOPS_LEVEL)*pt;
+   // FIX: khi broker trả về STOPS_LEVEL=0, dùng 10% InpMinSL_Points làm fallback
+   // thay vì 1 point — tránh SL quá gần entry bị reject
+   if(minDist<=0) minDist=InpMinSL_Points*pt*0.10;
+   if(minDist<=0) minDist=pt; // absolute last resort
+
+   if(dir==POSITION_TYPE_BUY)
+   {
+      if(entry-sl<minDist) sl=entry-minDist;
+      if(tp>0 && tp-entry<minDist) tp=entry+minDist;
+   }
+   else
+   {
+      if(sl-entry<minDist) sl=entry+minDist;
+      if(tp>0 && entry-tp<minDist) tp=entry-minDist;
+   }
+   sl=NormalizeDouble(sl,dg);
+   if(tp>0) tp=NormalizeDouble(tp,dg);
+}
+
+bool BuildAutoEntryStops(const int dir,const double entry,double& sl,double& tp)
+{
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   if(pt<=0) return false;
+
+   if(!InpSmartSLTP)
+   {
+      if(dir==POSITION_TYPE_BUY)
+      {
+         if(InpTP_Points>0) tp=NormalizeDouble(entry+InpTP_Points*pt,dg);
+         if(InpSL_Cross_Points>0) sl=NormalizeDouble(entry-InpSL_Cross_Points*pt,dg);
+         else { double h1l=H1Low(); if(h1l>0) sl=NormalizeDouble(h1l-InpExtraPoints*pt,dg); }
+      }
+      else
+      {
+         if(InpTP_Points>0) tp=NormalizeDouble(entry-InpTP_Points*pt,dg);
+         if(InpSL_Cross_Points>0) sl=NormalizeDouble(entry+InpSL_Cross_Points*pt,dg);
+         else { double h1h=H1High(); if(h1h>0) sl=NormalizeDouble(h1h+InpExtraPoints*pt,dg); }
+      }
+      if(sl<=0) return false;
+      EnforceStopDistance(dir,entry,sl,tp);
+      return true;
+   }
+
+   double atr=ATR_M5();
+   double minRisk=MathMax(InpMinSL_Points*pt,(double)SymbolInfoInteger(gSym,SYMBOL_TRADE_STOPS_LEVEL)*pt);
+   double maxRisk=InpMaxSL_Points>0?InpMaxSL_Points*pt:0;
+   double rr=MathMax(0.1,InpTP_RR);
+   double structBuffer=MathMax(0,InpStructureBuffer)*pt;
+   double risk=0;
+
+   if(dir==POSITION_TYPE_BUY)
+   {
+      double structLow=M5StructLow(InpStructureBars);
+      double atrSL=atr>0?entry-atr*InpSL_ATR_Mult:0;
+      double structSL=structLow>0?structLow-structBuffer:0;
+      sl=(structSL>0&&atrSL>0)?MathMin(structSL,atrSL):(structSL>0?structSL:atrSL);
+      if(sl<=0) sl=entry-minRisk;
+      risk=entry-sl;
+      if(risk<minRisk) risk=minRisk;
+      if(maxRisk>0&&risk>maxRisk) risk=maxRisk;
+      sl=NormalizeDouble(entry-risk,dg);
+      tp=NormalizeDouble(entry+risk*rr,dg);
+   }
+   else
+   {
+      double structHigh=M5StructHigh(InpStructureBars);
+      double atrSL=atr>0?entry+atr*InpSL_ATR_Mult:0;
+      double structSL=structHigh>0?structHigh+structBuffer:0;
+      sl=(structSL>0&&atrSL>0)?MathMax(structSL,atrSL):(structSL>0?structSL:atrSL);
+      if(sl<=0) sl=entry+minRisk;
+      risk=sl-entry;
+      if(risk<minRisk) risk=minRisk;
+      if(maxRisk>0&&risk>maxRisk) risk=maxRisk;
+      sl=NormalizeDouble(entry+risk,dg);
+      tp=NormalizeDouble(entry-risk*rr,dg);
+   }
+
+   EnforceStopDistance(dir,entry,sl,tp);
+   return (sl>0 && tp>0);
+}
+
+//======================================================================
+//  FIX: TG_Send — encode đầy đủ hơn cho giá số thực (dấu . , %)
+//======================================================================
+bool TG_Send(string message)
+{
+   if(!TG_Enable) return true;
+   if(TG_BotToken=="YOUR_BOT_TOKEN" || TG_ChatID=="YOUR_CHAT_ID")
+   {
+      Print("TG: Token/ChatID not configured");
+      return false;
+   }
+
+   string encoded=message;
+   // Encode theo thứ tự: & và = trước, sau đó các ký tự còn lại
+   StringReplace(encoded,"&", "%26");
+   StringReplace(encoded,"=", "%3D");
+   StringReplace(encoded,"+", "%2B");
+   StringReplace(encoded,"#", "%23");
+   StringReplace(encoded,"<", "%3C");
+   StringReplace(encoded,">", "%3E");
+   StringReplace(encoded,":", "%3A");
+   StringReplace(encoded,"/", "%2F");
+   // FIX: thêm encode cho dấu chấm và phẩy — quan trọng với giá số thực XAUUSD
+   StringReplace(encoded,".", "%2E");
+   StringReplace(encoded,",", "%2C");
+   // Encode space và newline cuối cùng
+   StringReplace(encoded,"\n","%0A");
+   StringReplace(encoded," ", "%20");
+
+   string url="https://api.telegram.org/bot"+TG_BotToken+"/sendMessage";
+   string body="chat_id="+TG_ChatID+"&text="+encoded+"&parse_mode=HTML";
+   char post[],result[];
+   string headers="Content-Type: application/x-www-form-urlencoded\r\n";
+   string resultHeaders;
+   StringToCharArray(body,post,0,WHOLE_ARRAY,CP_UTF8);
+   if(ArraySize(post)>0) ArrayResize(post,ArraySize(post)-1);
+   int res=WebRequest("POST",url,headers,7000,post,result,resultHeaders);
+   if(res==-1)
+   {
+      int err=GetLastError();
+      Print("TG WebRequest error: ",err," | Add https://api.telegram.org to WebRequest allowed URLs");
+      Alert("Telegram WebRequest error ",err,". Allow https://api.telegram.org in MT5 Options.");
+      return false;
+   }
+   string response=CharArrayToString(result,0,-1,CP_UTF8);
+   if(res!=200)
+   {
+      Print("TG HTTP error: ",res," | ",response);
+      Alert("Telegram HTTP error ",res,". Check Bot Token / Chat ID / bot started.");
+      return false;
+   }
+   Print("TG sent OK: ",response);
+   return true;
+}
+
+string TG_DirStr(int dir){ return dir==POSITION_TYPE_BUY?"BUY":"SELL"; }
+string TG_Price(double p){ return DoubleToString(p,(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS)); }
+
+void TG_OnStart()
+{
+   if(!TG_TestOnInit) return;
+   string aeState=gAutoEntry?"ON":"OFF";
+   string smartState=InpSmartSLTP?"ON":"OFF";
+   string msg="AUTO SL EA STARTED\n"+
+              "Symbol: "+gSym+"\n"+
+              "AutoEntry: "+aeState+"\n"+
+              "SmartSLTP: "+smartState+"\n"+
+              "RR: 1:"+DoubleToString(InpTP_RR,1);
+   TG_Send(msg);
+}
+
+void TG_OnSignal(const int dir,const double entry,const double sl,const double tp)
+{
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   double riskPts=pt>0?MathAbs(entry-sl)/pt:0;
+   double tpPts=pt>0?MathAbs(tp-entry)/pt:0;
+   string mode=InpSmartSLTP?"ATR+Structure":"Fixed/Legacy";
+   string msg="AUTO ENTRY SIGNAL "+TG_DirStr(dir)+"\n"+
+              "Symbol: "+gSym+"\n"+
+              "Entry: "+TG_Price(entry)+"\n"+
+              "SL: "+TG_Price(sl)+" ("+DoubleToString(riskPts,0)+" pt)\n"+
+              "TP: "+TG_Price(tp)+" ("+DoubleToString(tpPts,0)+" pt)\n"+
+              "Lot: "+DoubleToString(InpLotSize,2)+"\n"+
+              "Mode: "+mode;
+   TG_Send(msg);
+}
+
+void TG_OnOpen(const int dir,const double entry,const double sl,const double tp,const ulong ticket)
+{
+   string msg="ORDER OPENED "+TG_DirStr(dir)+"\n"+
+              "Ticket: #"+IntegerToString((long)ticket)+"\n"+
+              "Symbol: "+gSym+"\n"+
+              "Entry: "+TG_Price(entry)+"\n"+
+              "SL: "+TG_Price(sl)+"\n"+
+              "TP: "+TG_Price(tp)+"\n"+
+              "Lot: "+DoubleToString(InpLotSize,2);
+   TG_Send(msg);
+}
+
+void TG_OnFail(const string action,const string detail)
+{
+   TG_Send(action+" FAILED\n"+gSym+"\n"+detail);
+}
 
 bool InSL(ulong t){ for(int i=0;i<ArraySize(tickSL);i++) if(tickSL[i]==t) return true; return false; }
 bool InBE(ulong t){ for(int i=0;i<ArraySize(tickBE);i++) if(tickBE[i]==t) return true; return false; }
@@ -510,20 +1003,26 @@ void AddSL(ulong t){ if(InSL(t))return; int s=ArraySize(tickSL); ArrayResize(tic
 void AddBE(ulong t){ if(InBE(t))return; int s=ArraySize(tickBE); ArrayResize(tickBE,s+1); tickBE[s]=t; }
 void AddCL(ulong t){ int s=ArraySize(tickCL); ArrayResize(tickCL,s+1); tickCL[s]=t; }
 
+//======================================================================
+//  FIX: CleanTicks — thêm giới hạn kích thước tickCL để tránh tăng vô hạn
+//======================================================================
 void CleanTicks()
 {
    ulong a[]; int c=0;
    for(int i=0;i<ArraySize(tickSL);i++) if(PositionSelectByTicket(tickSL[i])){ ArrayResize(a,c+1); a[c++]=tickSL[i]; }
    ArrayResize(tickSL,c); for(int i=0;i<c;i++) tickSL[i]=a[i];
+
    ulong b[]; int bc=0;
    for(int i=0;i<ArraySize(tickBE);i++) if(PositionSelectByTicket(tickBE[i])){ ArrayResize(b,bc+1); b[bc++]=tickBE[i]; }
    ArrayResize(tickBE,bc); for(int i=0;i<bc;i++) tickBE[i]=b[i];
+
+   // FIX: tickCL chỉ dùng để tham khảo, không cần giữ quá 500 phần tử
+   if(ArraySize(tickCL) > 500) ArrayResize(tickCL, 0);
 }
 
 bool ModRetry(ulong tk,double sl,double tp)
 {
-   for(int a=1;a<=InpRetryCount;a++)
-   {
+   for(int a=1;a<=InpRetryCount;a++){
       if(trade.PositionModify(tk,sl,tp)) return true;
       uint rc=trade.ResultRetcode();
       if(rc==TRADE_RETCODE_INVALID_STOPS||rc==TRADE_RETCODE_TRADE_DISABLED||rc==TRADE_RETCODE_MARKET_CLOSED) return false;
@@ -533,8 +1032,7 @@ bool ModRetry(ulong tk,double sl,double tp)
 }
 bool ClsRetry(ulong tk)
 {
-   for(int a=1;a<=InpRetryCount;a++)
-   {
+   for(int a=1;a<=InpRetryCount;a++){
       if(trade.PositionClose(tk,ULONG_MAX)) return true;
       if(!PositionSelectByTicket(tk)) return true;
       uint rc=trade.ResultRetcode();
@@ -549,17 +1047,16 @@ bool ClsRetry(ulong tk)
 //======================================================================
 void DoSetSL()
 {
-   double h1h=H1High(); if(h1h<=0) return;
-   double h1l=H1Low();  if(h1l<=0) return;
+   double m5h=M5High(); if(m5h<=0) return;
+   double m5l=M5Low();  if(m5l<=0) return;
    double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
    int    dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
-   double slS=NormalizeDouble(h1h+InpExtraPoints*pt,dg);
-   double slB=NormalizeDouble(h1l-InpExtraPoints*pt,dg);
-
+   double slS=NormalizeDouble(m5h,dg);
+   double slB=NormalizeDouble(m5l,dg);
    ulong need[]; int nc=0;
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
+   for(int i=PositionsTotal()-1;i>=0;i--){
       if(!posInfo.SelectByIndex(i)||posInfo.Symbol()!=gSym) continue;
+      if(InpProtectAESL&&IsAEPosition()) continue;
       int tp=(int)posInfo.PositionType(); ulong tk=posInfo.Ticket(); double cs=posInfo.StopLoss();
       if(InpOnlyBuy&&tp!=POSITION_TYPE_BUY) continue;
       if(InpOnlySell&&tp!=POSITION_TYPE_SELL) continue;
@@ -571,11 +1068,9 @@ void DoSetSL()
       ArrayResize(need,nc+1); need[nc++]=tk;
    }
    if(nc==0){ CleanTicks(); return; }
-
    gBatchRunning=true;
    int ok=0,fail=0;
-   for(int i=0;i<nc;i++)
-   {
+   for(int i=0;i<nc;i++){
       if(!PositionSelectByTicket(need[i])) continue;
       int tp=(int)PositionGetInteger(POSITION_TYPE);
       double tSL=(tp==POSITION_TYPE_BUY)?slB:slS;
@@ -585,16 +1080,15 @@ void DoSetSL()
       if(i<nc-1&&InpBatchDelay>0) Sleep(InpBatchDelay);
    }
    gBatchRunning=false;
-   Log(StringFormat("SL: %d OK / %d FAIL | BUY=%.2f SELL=%.2f",ok,fail,slB,slS),ok>0?"ok":"err");
-   if(InpAlertOnSet&&ok>0) Alert(StringFormat("[AutoSL] %d lenh | BUY SL=%.2f | SELL SL=%.2f",ok,slB,slS));
+   Log(StringFormat("SL M5: %d OK / %d FAIL | BUY=%.2f SELL=%.2f",ok,fail,slB,slS),ok>0?"ok":"err");
+   if(InpAlertOnSet&&ok>0) Alert(StringFormat("[AutoSL M5] %d lenh | BUY SL=%.2f | SELL SL=%.2f",ok,slB,slS));
    CleanTicks();
 }
 
 void DoBreakeven()
 {
    int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
+   for(int i=PositionsTotal()-1;i>=0;i--){
       if(!posInfo.SelectByIndex(i)||posInfo.Symbol()!=gSym) continue;
       int tp=(int)posInfo.PositionType(); ulong tk=posInfo.Ticket();
       double lot=posInfo.Volume(),entry=posInfo.PriceOpen(),cSL=posInfo.StopLoss(),cTP=posInfo.TakeProfit();
@@ -605,54 +1099,235 @@ void DoBreakeven()
       double newSL=0;
       if(tp==POSITION_TYPE_BUY){ newSL=NormalizeDouble(entry+off,dg); if(cSL>=newSL) continue; }
       else                     { newSL=NormalizeDouble(entry-off,dg); if(cSL>0&&cSL<=newSL) continue; }
-      if(ModRetry(tk,newSL,cTP))
-      {
+      if(ModRetry(tk,newSL,cTP)){
          statBEOk++; AddBE(tk);
          string dir=(tp==POSITION_TYPE_BUY)?"BUY":"SELL";
          Log(StringFormat("BE+ #%I64u %s $%.2f >> SL=%.2f (+$%.2f)",tk,dir,pnl,newSL,InpBELock),"ok");
          Alert(StringFormat("[BE+] #%I64u %s | Lai=$%.2f | SL=%.2f | Lock +$%.2f",tk,dir,pnl,newSL,InpBELock));
+         TG_Send(StringFormat("BREAKEVEN %s\nTicket: #%I64u\nPnL: %.2f\nNew SL: %s",
+                 dir,tk,pnl,TG_Price(newSL)));
       }
    }
 }
 
 void DoAutoClose()
 {
-   MqlDateTime dt; TimeToStruct(TimeCurrent(),dt); int cm=dt.min;
-   if(gCloseTrig&&cm!=InpCloseMinute) gCloseTrig=false;
-   int ml=InpCloseMinute-cm; if(ml<0)ml+=60;
-   if(ml>0&&ml<=InpCloseWarning&&gLastWarnMn!=cm)
-   { int cnt=CntPos(); if(cnt>0){ Log(StringFormat("CANH BAO: %d phut | %d lenh",ml,cnt),"warn"); gLastWarnMn=cm; } }
-   if(cm!=InpCloseMinute||gCloseTrig) return;
+   static bool invalidMinuteWarned = false;
+   if(InpCloseMinute < 0 || InpCloseMinute > 59)
+   {
+      if(!invalidMinuteWarned)
+      {
+         Log("AutoClose disabled: InpCloseMinute must be 0..59","err");
+         invalidMinuteWarned = true;
+      }
+      return;
+   }
+
+   MqlDateTime d;
+   TimeToStruct(TimeCurrent(), d);
+
+   int mnLeft = InpCloseMinute - d.min;
+   if(mnLeft < 0) mnLeft += 60;
+
+   if(mnLeft > 0)
+   {
+      gLastCloseMn = -1;
+      if(InpCloseWarning > 0 && mnLeft <= InpCloseWarning && gLastWarnMn != d.min)
+      {
+         gLastWarnMn = d.min;
+         Log(StringFormat("AutoClose warning: %d minute(s) left before minute %02d",mnLeft,InpCloseMinute),"warn");
+      }
+      return;
+   }
+
+   if(gLastCloseMn == d.min) return;
 
    ulong tc[]; int tcc=0;
-   for(int i=PositionsTotal()-1;i>=0;i--)
-   {
+   for(int i=PositionsTotal()-1;i>=0;i--){
       if(!posInfo.SelectByIndex(i)||posInfo.Symbol()!=gSym) continue;
       int tp=(int)posInfo.PositionType();
       if((InpOnlyBuy&&tp!=POSITION_TYPE_BUY)||(InpOnlySell&&tp!=POSITION_TYPE_SELL)) continue;
       ArrayResize(tc,tcc+1); tc[tcc++]=posInfo.Ticket();
    }
-   if(tcc==0){ gCloseTrig=true; return; }
+   gLastCloseMn = d.min;
+   if(tcc==0) return;
    gBatchRunning=true;
-   Log(StringFormat("AUTO CLOSE: dong %d lenh @ phut %02d",tcc,InpCloseMinute),"warn");
+   Log(StringFormat("AUTO CLOSE TIME: dong %d lenh tai phut %02d",tcc,InpCloseMinute),"warn");
    int ok=0,fail=0;
-   for(int i=0;i<tcc;i++)
-   {
+   for(int i=0;i<tcc;i++){
       if(ClsRetry(tc[i])){ ok++; statClOk++; AddCL(tc[i]); }
       else{ fail++; statClFail++; }
       if(i<tcc-1&&InpBatchDelay>0) Sleep(InpBatchDelay);
    }
-   gBatchRunning=false; gCloseTrig=true; gLastCloseMn=cm;
+   gBatchRunning=false;
    Log(StringFormat("Close: %d OK / %d FAIL",ok,fail),ok>0?"ok":"err");
-   if(InpAlertOnClose) Alert(StringFormat("[AutoClose] %d/%d lenh @ phut %02d",ok,tcc,InpCloseMinute));
+   if(InpAlertOnClose) Alert(StringFormat("[AutoClose Time] %d/%d lenh | Minute=%02d",ok,tcc,InpCloseMinute));
+   TG_Send(StringFormat("AUTO CLOSE TIME\nSymbol: %s\nClosed: %d/%d\nMinute: %02d",gSym,ok,tcc,InpCloseMinute));
+}
+
+//======================================================================
+//  v11: AUTO ENTRY ON EMA CROSS
+//
+//  FIX 1: iBarShift dùng exact=true thay vì false
+//  FIX 2: gLastCrossBar set TRƯỚC khi mở lệnh (không phụ thuộc kết quả)
+//  FIX 3: off-by-one — cooldown tính từ bar[1] về bar[0] = 1 tick,
+//         nên prevIdx từ iBarShift đã đo đúng; chỉ cần đảm bảo exact=true
+//======================================================================
+void CheckEMACross()
+{
+   if(!gAutoEntry) return;
+   if(gBatchRunning) return;
+
+   double f[], m[];
+   ArraySetAsSeries(f,true); ArraySetAsSeries(m,true);
+   if(CopyBuffer(hFast,0,0,3,f)<3 || CopyBuffer(hMid,0,0,3,m)<3) return;
+
+   bool curAbove = (f[1] > m[1]);
+   bool curBelow = (f[1] < m[1]);
+   bool prvAbove = gPrevGolden;
+   bool prvBelow = gPrevDeath;
+
+   bool isGolden = (!prvAbove && curAbove);
+   bool isDeath  = (!prvBelow && curBelow);
+
+   // Cập nhật trạng thái cho lần check tiếp theo
+   gPrevGolden = curAbove;
+   gPrevDeath  = curBelow;
+
+   if(!isGolden && !isDeath) return;
+
+   datetime barTime = iTime(gSym, PERIOD_M5, 1);
+
+   // Cooldown check: barTime == gLastCrossBar nghĩa là cùng bar đã xử lý
+   if(barTime == gLastCrossBar) return;
+
+   // FIX 1: dùng exact=true để iBarShift trả về -1 khi không tìm thấy
+   //        thay vì tìm bar gần nhất (có thể gây false cooldown)
+   if(InpCrossCooldownBars > 0 && gLastCrossBar > 0)
+   {
+      int prevIdx = iBarShift(gSym, PERIOD_M5, gLastCrossBar, true);
+      // Nếu bar không còn trong history (prevIdx==-1), bỏ qua cooldown
+      if(prevIdx >= 0 && prevIdx < InpCrossCooldownBars + 1) return;
+   }
+
+   if(isGolden && InpOnlySell) return;
+   if(isDeath  && InpOnlyBuy)  return;
+
+   if(InpBlockOppSignal)
+   {
+      EmaSnap snap;
+      if(GetEMA(snap))
+      {
+         Signal curSig=Analyze(snap);
+         if(isGolden && curSig.sig=="SELL")
+         {
+            Log("AE BUY blocked: current EMA signal is SELL","warn");
+            TG_OnFail("AE BUY","Blocked because current EMA signal is SELL");
+            return;
+         }
+         if(isDeath && curSig.sig=="BUY")
+         {
+            Log("AE SELL blocked: current EMA signal is BUY","warn");
+            TG_OnFail("AE SELL","Blocked because current EMA signal is BUY");
+            return;
+         }
+      }
+   }
+
+   double ask = SymbolInfoDouble(gSym, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(gSym, SYMBOL_BID);
+   double tpPrice = 0.0;
+   double slPrice = 0.0;
+   string analysisDetail = "";
+
+   if(isGolden)
+   {
+      if(!BuildAutoEntryStopsFromAnalysis(POSITION_TYPE_BUY,ask,slPrice,tpPrice,analysisDetail))
+      {
+         statAEFail++;
+         // FIX 2: set gLastCrossBar ngay cả khi fail tính SL/TP
+         // để tránh retry liên tục trên cùng 1 cross signal
+         gLastCrossBar  = barTime;
+         gLastCrossType = "GOLDEN";
+         Log("AE BUY FAIL: "+analysisDetail,"err");
+         TG_OnFail("AE BUY",analysisDetail);
+         return;
+      }
+
+      Log(StringFormat("GOLDEN CROSS -> BUY | Lot=%.2f | Ask=%.2f | TP=%.2f | SL=%.2f | %s",
+          InpLotSize, ask, tpPrice, slPrice, analysisDetail), "info");
+      TG_OnSignal(POSITION_TYPE_BUY,ask,slPrice,tpPrice);
+
+      // FIX 2: set gLastCrossBar TRƯỚC khi gọi trade.Buy
+      // để mọi tình huống (ok/fail/exception) đều không re-enter trên bar này
+      gLastCrossBar  = barTime;
+      gLastCrossType = "GOLDEN";
+
+      bool ok = trade.Buy(InpLotSize, gSym, ask, slPrice, tpPrice,
+                          StringFormat("AE Golden %d/%d",gEmaFast,gEmaMid));
+      if(ok)
+      {
+         statAEOk++;
+         Log(StringFormat("AE BUY OK #%I64u | %.2f lots @ %.2f",
+             trade.ResultOrder(), InpLotSize, ask), "ok");
+         TG_OnOpen(POSITION_TYPE_BUY,ask,slPrice,tpPrice,trade.ResultOrder());
+         if(InpEntryAlertCross)
+            Alert(StringFormat("[AutoEntry] BUY | Golden Cross EMA%d/%d | Lot=%.2f | @ %.2f",
+                  gEmaFast, gEmaMid, InpLotSize, ask));
+      }
+      else
+      {
+         statAEFail++;
+         Log(StringFormat("AE BUY FAIL: %s (%d)",trade.ResultComment(),trade.ResultRetcode()),"err");
+         TG_OnFail("AE BUY",trade.ResultComment());
+         // gLastCrossBar đã set, cooldown vẫn hoạt động đúng
+      }
+   }
+   else if(isDeath)
+   {
+      if(!BuildAutoEntryStopsFromAnalysis(POSITION_TYPE_SELL,bid,slPrice,tpPrice,analysisDetail))
+      {
+         statAEFail++;
+         // FIX 2: set ngay cả khi fail tính SL/TP
+         gLastCrossBar  = barTime;
+         gLastCrossType = "DEATH";
+         Log("AE SELL FAIL: "+analysisDetail,"err");
+         TG_OnFail("AE SELL",analysisDetail);
+         return;
+      }
+
+      Log(StringFormat("DEATH CROSS -> SELL | Lot=%.2f | Bid=%.2f | TP=%.2f | SL=%.2f | %s",
+          InpLotSize, bid, tpPrice, slPrice, analysisDetail), "info");
+      TG_OnSignal(POSITION_TYPE_SELL,bid,slPrice,tpPrice);
+
+      // FIX 2: set TRƯỚC khi trade.Sell
+      gLastCrossBar  = barTime;
+      gLastCrossType = "DEATH";
+
+      bool ok = trade.Sell(InpLotSize, gSym, bid, slPrice, tpPrice,
+                           StringFormat("AE Death %d/%d",gEmaFast,gEmaMid));
+      if(ok)
+      {
+         statAEOk++;
+         Log(StringFormat("AE SELL OK #%I64u | %.2f lots @ %.2f",
+             trade.ResultOrder(), InpLotSize, bid), "ok");
+         TG_OnOpen(POSITION_TYPE_SELL,bid,slPrice,tpPrice,trade.ResultOrder());
+         if(InpEntryAlertCross)
+            Alert(StringFormat("[AutoEntry] SELL | Death Cross EMA%d/%d | Lot=%.2f | @ %.2f",
+                  gEmaFast, gEmaMid, InpLotSize, bid));
+      }
+      else
+      {
+         statAEFail++;
+         Log(StringFormat("AE SELL FAIL: %s (%d)",trade.ResultComment(),trade.ResultRetcode()),"err");
+         TG_OnFail("AE SELL",trade.ResultComment());
+      }
+   }
 }
 
 //======================================================================
 //  EMA ANALYSIS
 //======================================================================
-struct EmaSnap { double f,m,s,fp,mp,sp,price; };
-struct Signal  { string trend,sig,str,reason; color tc,sc; int score; };
-
 bool GetEMA(EmaSnap& e)
 {
    double f[],m[],s[];
@@ -670,25 +1345,336 @@ Signal Analyze(EmaSnap& e)
    bool pAboveF=e.price>e.f,pAboveM=e.price>e.m,pAboveS=e.price>e.s;
    bool fRising=e.f>e.fp,mRising=e.m>e.mp;
    bool golden=(e.f>e.m)&&(e.fp<=e.mp), death=(e.f<e.m)&&(e.fp>=e.mp);
-
    if(fAboveM)r.score+=10;else r.score-=10; if(fAboveS)r.score+=12;else r.score-=12;
    if(mAboveS)r.score+=10;else r.score-=10; if(pAboveF)r.score+=6; else r.score-=6;
    if(pAboveM)r.score+=6; else r.score-=6;  if(pAboveS)r.score+=6; else r.score-=6;
    if(fRising)r.score+=5; else r.score-=5;  if(mRising)r.score+=5; else r.score-=5;
    r.score=MathMax(0,MathMin(100,r.score));
-
-   if(r.score>=65)     { r.trend="BULLISH";r.tc=C_GREEN;  }
-   else if(r.score<=35){ r.trend="BEARISH";r.tc=C_RED;    }
-   else                { r.trend="SIDEWAY";r.tc=C_ORANGE; }
-
-   if(golden&&mAboveS)             { r.sig="BUY"; r.sc=C_GREEN; r.str="MANH";       r.reason=StringFormat("Golden Cross EMA%d/%d | Stack bullish M5",gEmaFast,gEmaMid); }
-   else if(death&&!mAboveS)        { r.sig="SELL";r.sc=C_RED;   r.str="MANH";       r.reason=StringFormat("Death Cross EMA%d/%d | Stack bearish M5",gEmaFast,gEmaMid); }
-   else if(r.trend=="BULLISH"&&pAboveF&&pAboveM&&fAboveS){ r.sig="BUY"; r.sc=C_GREEN; r.str="TRUNG BINH";r.reason=StringFormat("Gia > EMA%d & EMA%d | Xu huong tang M5",gEmaFast,gEmaMid); }
-   else if(r.trend=="BEARISH"&&!pAboveF&&!pAboveM&&!fAboveS){ r.sig="SELL";r.sc=C_RED; r.str="TRUNG BINH";r.reason=StringFormat("Gia < EMA%d & EMA%d | Xu huong giam M5",gEmaFast,gEmaMid); }
-   else if(r.trend=="BULLISH"&&!pAboveF&&pAboveM){ r.sig="BUY"; r.sc=C_YELLOW;r.str="YEU";r.reason=StringFormat("Pullback EMA%d | Cho nen xac nhan M5",gEmaFast); }
-   else if(r.trend=="BEARISH"&&pAboveF&&!pAboveM){ r.sig="SELL";r.sc=C_YELLOW;r.str="YEU";r.reason=StringFormat("Pullback EMA%d | Cho nen xac nhan M5",gEmaFast); }
-   else { r.sig="WAIT";r.sc=C_ORANGE;r.str="---";r.reason="EMA M5 chua xac dinh xu huong ro rang"; }
+   if(r.score>=65)      {r.trend="BULLISH";r.tc=C_GREEN;}
+   else if(r.score<=35) {r.trend="BEARISH";r.tc=C_RED;}
+   else                 {r.trend="SIDEWAY";r.tc=C_ORANGE;}
+   if(golden&&mAboveS)             {r.sig="BUY"; r.sc=C_GREEN; r.str="MANH";       r.reason=StringFormat("Golden Cross EMA%d/%d | Stack bullish M5",gEmaFast,gEmaMid);}
+   else if(death&&!mAboveS)        {r.sig="SELL";r.sc=C_RED;   r.str="MANH";       r.reason=StringFormat("Death Cross EMA%d/%d | Stack bearish M5",gEmaFast,gEmaMid);}
+   else if(r.trend=="BULLISH"&&pAboveF&&pAboveM&&fAboveS){r.sig="BUY"; r.sc=C_GREEN;  r.str="TRUNG BINH";r.reason=StringFormat("Gia > EMA%d & EMA%d | Xu huong tang M5",gEmaFast,gEmaMid);}
+   else if(r.trend=="BEARISH"&&!pAboveF&&!pAboveM&&!fAboveS){r.sig="SELL";r.sc=C_RED; r.str="TRUNG BINH";r.reason=StringFormat("Gia < EMA%d & EMA%d | Xu huong giam M5",gEmaFast,gEmaMid);}
+   else if(r.trend=="BULLISH"&&!pAboveF&&pAboveM){r.sig="BUY"; r.sc=C_YELLOW;r.str="YEU";r.reason=StringFormat("Pullback EMA%d | Cho nen xac nhan M5",gEmaFast);}
+   else if(r.trend=="BEARISH"&&pAboveF&&!pAboveM){r.sig="SELL";r.sc=C_YELLOW;r.str="YEU";r.reason=StringFormat("Pullback EMA%d | Cho nen xac nhan M5",gEmaFast);}
+   else {r.sig="WAIT";r.sc=C_ORANGE;r.str="---";r.reason="EMA M5 chua xac dinh xu huong ro rang";}
    return r;
+}
+
+EntryPlan BuildEntryPlan(EmaSnap& e,Signal& sig)
+{
+   EntryPlan p;
+   p.ready=false; p.dir="WAIT"; p.note="Cho tin hieu ro"; p.entry=0; p.sl=0; p.tp=0; p.clr=C_ORANGE;
+   if(sig.sig=="WAIT") return p;
+
+   double ask=SymbolInfoDouble(gSym,SYMBOL_ASK);
+   double bid=SymbolInfoDouble(gSym,SYMBOL_BID);
+   double atr=ATR_M5();
+   double near=atr>0 ? atr*0.20 : SymbolInfoDouble(gSym,SYMBOL_POINT)*InpMinSL_Points*0.10;
+   bool strong=(sig.str=="MANH");
+
+   if(sig.sig=="BUY" && !InpOnlySell)
+   {
+      p.dir="BUY";
+      p.clr=C_GREEN;
+      p.entry=(strong || MathAbs(bid-e.f)<=near) ? ask : e.f;
+      p.note=strong ? "Break/cross confirmed" : "Cho gia hoi ve EMA fast";
+      p.ready=BuildAutoEntryStops(POSITION_TYPE_BUY,p.entry,p.sl,p.tp);
+   }
+   else if(sig.sig=="SELL" && !InpOnlyBuy)
+   {
+      p.dir="SELL";
+      p.clr=C_RED;
+      p.entry=(strong || MathAbs(bid-e.f)<=near) ? bid : e.f;
+      p.note=strong ? "Break/cross confirmed" : "Cho gia hoi ve EMA fast";
+      p.ready=BuildAutoEntryStops(POSITION_TYPE_SELL,p.entry,p.sl,p.tp);
+   }
+   return p;
+}
+
+bool BuildAutoEntryStopsFromAnalysis(const int dir,const double marketEntry,double& sl,double& tp,string& detail)
+{
+   EntryPlan p;
+   detail="";
+   bool hasPlan=false;
+
+   if(gManualPlanActive && gManualPlan.ready)
+   {
+      p=gManualPlan;
+      hasPlan=true;
+      detail="manual ANALYZE plan";
+   }
+   else
+   {
+      hasPlan=AnalyzeCandlesOnDemand(p,detail);
+      if(hasPlan) detail="auto 3D analysis: "+detail;
+   }
+
+   if(!hasPlan || !p.ready)
+   {
+      detail=(detail=="" ? "analysis plan unavailable" : detail);
+      return false;
+   }
+
+   bool dirMatch=(dir==POSITION_TYPE_BUY && p.dir=="BUY") || (dir==POSITION_TYPE_SELL && p.dir=="SELL");
+   if(!dirMatch)
+   {
+      detail=StringFormat("analysis direction %s does not match EMA cross",p.dir);
+      return false;
+   }
+
+   sl=p.sl;
+   tp=p.tp;
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   double minDist=(double)SymbolInfoInteger(gSym,SYMBOL_TRADE_STOPS_LEVEL)*pt;
+   if(minDist<=0) minDist=InpMinSL_Points*pt*0.10;
+   if(minDist<=0) minDist=pt;
+   bool invalid=(dir==POSITION_TYPE_BUY)
+      ? ((marketEntry-sl)<minDist || (tp>0 && (tp-marketEntry)<minDist))
+      : ((sl-marketEntry)<minDist || (tp>0 && (marketEntry-tp)<minDist));
+   if(invalid)
+   {
+      detail=StringFormat("%s | ANALYZE SL/TP too close for market entry %.2f",detail,marketEntry);
+      return false;
+   }
+   detail=StringFormat("%s | SL from ANALYZE %.2f | TP %.2f",detail,sl,tp);
+   return (sl>0 && tp>0);
+}
+
+bool AnalyzeAndPlaceLimit(string& detail)
+{
+   EntryPlan p;
+   detail="";
+   if(!AnalyzeCandlesOnDemand(p,detail) || !p.ready)
+   {
+      statLimitFail++;
+      gManualPlanActive=false;
+      gManualPlanTime=TimeCurrent();
+      gManualPlanText=(detail=="" ? "Limit: no clean setup" : detail);
+      return false;
+   }
+
+   gManualPlan=p;
+   gManualPlanActive=true;
+   gManualPlanTime=TimeCurrent();
+   gManualPlanText=detail;
+
+   double ask=SymbolInfoDouble(gSym,SYMBOL_ASK);
+   double bid=SymbolInfoDouble(gSym,SYMBOL_BID);
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   double minDist=(double)SymbolInfoInteger(gSym,SYMBOL_TRADE_STOPS_LEVEL)*pt;
+   if(minDist<=0) minDist=InpMinSL_Points*pt*0.10;
+   if(minDist<=0) minDist=pt;
+
+   datetime exp=0;
+   ENUM_ORDER_TYPE_TIME timeType=ORDER_TIME_GTC;
+   if(InpLimitExpireHours>0)
+   {
+      timeType=ORDER_TIME_SPECIFIED;
+      exp=TimeCurrent()+InpLimitExpireHours*3600;
+   }
+
+   bool ok=false;
+   if(p.dir=="BUY")
+   {
+      if(p.entry >= ask-minDist)
+      {
+         statLimitFail++;
+         detail=StringFormat("BUY LIMIT skipped: entry %.2f is not below Ask %.2f enough",p.entry,ask);
+         return false;
+      }
+      ok=trade.BuyLimit(InpLotSize,p.entry,gSym,p.sl,p.tp,timeType,exp,
+                        StringFormat("ANALYZE BuyLimit %dD",gAnalysisDays));
+   }
+   else if(p.dir=="SELL")
+   {
+      if(p.entry <= bid+minDist)
+      {
+         statLimitFail++;
+         detail=StringFormat("SELL LIMIT skipped: entry %.2f is not above Bid %.2f enough",p.entry,bid);
+         return false;
+      }
+      ok=trade.SellLimit(InpLotSize,p.entry,gSym,p.sl,p.tp,timeType,exp,
+                         StringFormat("ANALYZE SellLimit %dD",gAnalysisDays));
+   }
+   else
+   {
+      statLimitFail++;
+      detail="LIMIT skipped: analysis has no BUY/SELL direction";
+      return false;
+   }
+
+   if(ok)
+   {
+      statLimitOk++;
+      detail=StringFormat("%s LIMIT placed | Entry %.2f | SL %.2f | TP %.2f | Exp %dh",
+                          p.dir,p.entry,p.sl,p.tp,InpLimitExpireHours);
+      TG_Send(detail);
+      return true;
+   }
+
+   statLimitFail++;
+   detail=StringFormat("%s LIMIT failed: %s (%d)",p.dir,trade.ResultComment(),trade.ResultRetcode());
+   TG_OnFail(p.dir+" LIMIT",trade.ResultComment());
+   return false;
+}
+
+bool AnalyzeCandlesOnDemand(EntryPlan& plan,string& detail)
+{
+   plan.ready=false; plan.dir="WAIT"; plan.note="No setup"; plan.entry=0; plan.sl=0; plan.tp=0; plan.clr=C_ORANGE;
+   detail="No 3-day candle setup";
+
+   int tfSec=PeriodSeconds(PERIOD_M5);
+   int barsPerDay=(tfSec>0 ? 86400/tfSec : 288);
+   int lookback=MathMax(60,gAnalysisDays*barsPerDay);
+   MqlRates r[];
+   ArraySetAsSeries(r,true);
+   int got=CopyRates(gSym,PERIOD_M5,0,lookback+5,r);
+   int n=MathMin(lookback,got-1);
+   if(n<120)
+   {
+      detail=StringFormat("Need more M5 history for %d-day analysis",gAnalysisDays);
+      return false;
+   }
+
+   EmaSnap ema;
+   if(!GetEMA(ema))
+   {
+      detail="EMA unavailable";
+      return false;
+   }
+   Signal sig=Analyze(ema);
+
+   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
+   double ask=SymbolInfoDouble(gSym,SYMBOL_ASK);
+   double bid=SymbolInfoDouble(gSym,SYMBOL_BID);
+   double atr=ATR_M5();
+   double minPad=(atr>0 ? atr*0.15 : InpMinSL_Points*pt*0.10);
+
+   double hi=r[1].high,lo=r[1].low;
+   int recentN=MathMin(96,n);
+   double recentHi=r[1].high,recentLo=r[1].low;
+   int bull=0,bear=0;
+   double bodySum=0,rangeSum=0;
+   long volSum=0;
+   for(int i=1;i<=n;i++)
+   {
+      hi=MathMax(hi,r[i].high);
+      lo=MathMin(lo,r[i].low);
+      if(i<=recentN)
+      {
+         recentHi=MathMax(recentHi,r[i].high);
+         recentLo=MathMin(recentLo,r[i].low);
+      }
+      if(r[i].close>r[i].open) bull++;
+      else if(r[i].close<r[i].open) bear++;
+      bodySum+=MathAbs(r[i].close-r[i].open);
+      rangeSum+=MathMax(r[i].high-r[i].low,pt);
+      volSum+=(long)r[i].tick_volume;
+   }
+
+   double closeNow=r[1].close;
+   double closeStart=r[n].close;
+   double threeRange=MathMax(hi-lo,pt);
+   double recentRange=MathMax(recentHi-recentLo,pt);
+   double pos3d=(closeNow-lo)/threeRange;
+   double pressure=(double)(bull-bear)/(double)n;
+
+   int bestDir=-1,bestScore=0,bestIdx=1;
+   string pattern="3-day value pullback";
+   int scanN=MathMin(36,n-1);
+   for(int i=1;i<=scanN;i++)
+   {
+      double o1=r[i].open,c1=r[i].close,h1=r[i].high,l1=r[i].low;
+      double o2=r[i+1].open,c2=r[i+1].close;
+      double range=MathMax(h1-l1,pt);
+      double body=MathAbs(c1-o1);
+      double upper=h1-MathMax(o1,c1);
+      double lower=MathMin(o1,c1)-l1;
+      bool bullCandle=(c1>o1);
+      bool bearCandle=(c1<o1);
+      bool bullEngulf=bullCandle && c2<o2 && c1>o2 && o1<c2;
+      bool bearEngulf=bearCandle && c2>o2 && c1<o2 && o1>c2;
+      bool bullPin=lower>=body*1.8 && upper<=range*0.35 && c1>l1+range*0.55;
+      bool bearPin=upper>=body*1.8 && lower<=range*0.35 && c1<l1+range*0.45;
+      bool bullMomentum=bullCandle && body>=range*0.60 && c1>ema.f;
+      bool bearMomentum=bearCandle && body>=range*0.60 && c1<ema.f;
+      int recency=scanN-i+1;
+      int sc=0,dir0=-1;
+      string pat="";
+      if(bullEngulf){ sc=45+recency; dir0=POSITION_TYPE_BUY; pat="Bullish engulfing"; }
+      else if(bearEngulf){ sc=45+recency; dir0=POSITION_TYPE_SELL; pat="Bearish engulfing"; }
+      else if(bullPin){ sc=38+recency; dir0=POSITION_TYPE_BUY; pat="Bullish rejection wick"; }
+      else if(bearPin){ sc=38+recency; dir0=POSITION_TYPE_SELL; pat="Bearish rejection wick"; }
+      else if(bullMomentum){ sc=30+recency; dir0=POSITION_TYPE_BUY; pat="Bullish momentum"; }
+      else if(bearMomentum){ sc=30+recency; dir0=POSITION_TYPE_SELL; pat="Bearish momentum"; }
+      if(sc>bestScore)
+      {
+         bestScore=sc;
+         bestDir=dir0;
+         bestIdx=i;
+         pattern=pat;
+      }
+   }
+
+   int bias=0;
+   if(closeNow>closeStart) bias+=1; else bias-=1;
+   if(pos3d>0.62) bias+=1; else if(pos3d<0.38) bias-=1;
+   if(pressure>0.06) bias+=1; else if(pressure<-0.06) bias-=1;
+   if(ema.f>ema.m && ema.m>ema.s) bias+=2;
+   else if(ema.f<ema.m && ema.m<ema.s) bias-=2;
+   if(sig.sig=="BUY") bias+=1;
+   else if(sig.sig=="SELL") bias-=1;
+   if(bestDir==POSITION_TYPE_BUY) bias+=2;
+   else if(bestDir==POSITION_TYPE_SELL) bias-=2;
+
+   int dir=-1;
+   if(bias>=2 && !InpOnlySell) dir=POSITION_TYPE_BUY;
+   else if(bias<=-2 && !InpOnlyBuy) dir=POSITION_TYPE_SELL;
+
+   if(dir<0)
+   {
+      detail=StringFormat("%dD M5 neutral | Bias %d | Range %.2f..%.2f",gAnalysisDays,bias,lo,hi);
+      return false;
+   }
+
+   double mid=(r[bestIdx].open+r[bestIdx].close)*0.5;
+   int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   plan.dir=(dir==POSITION_TYPE_BUY)?"BUY":"SELL";
+   plan.clr=(dir==POSITION_TYPE_BUY)?C_GREEN:C_RED;
+
+   if(dir==POSITION_TYPE_BUY)
+   {
+      double valueZone=recentLo+recentRange*0.382;
+      double pullback=MathMax(recentLo+minPad,MathMin(MathMax(valueZone,mid),ema.f));
+      if(pullback<=0 || pullback>ask+recentRange) pullback=MathMin(ema.f,closeNow);
+      bool nearNow=(ask<=pullback+minPad && ask>=pullback-minPad);
+      plan.entry=NormalizeDouble(nearNow?ask:pullback,dg);
+      plan.note=nearNow?"3D value zone now":"Wait pullback to 3D value";
+   }
+   else
+   {
+      double valueZone=recentHi-recentRange*0.382;
+      double pullback=MathMin(recentHi-minPad,MathMax(MathMin(valueZone,mid),ema.f));
+      if(pullback<=0 || pullback<bid-recentRange) pullback=MathMax(ema.f,closeNow);
+      bool nearNow=(bid>=pullback-minPad && bid<=pullback+minPad);
+      plan.entry=NormalizeDouble(nearNow?bid:pullback,dg);
+      plan.note=nearNow?"3D value zone now":"Wait pullback to 3D value";
+   }
+
+   plan.ready=BuildAutoEntryStops(dir,plan.entry,plan.sl,plan.tp);
+   if(!plan.ready)
+   {
+      detail="Candle setup found but SL/TP failed";
+      return false;
+   }
+
+   double riskPts=pt>0?MathAbs(plan.entry-plan.sl)/pt:0;
+   detail=StringFormat("%dD M5 %s %s | Bias %d | Entry %.2f | Risk %.0fpt",
+                       gAnalysisDays,pattern,plan.dir,bias,plan.entry,riskPts);
+   return true;
 }
 
 //======================================================================
@@ -733,24 +1719,17 @@ void Lbl(string n,int x,int y,string txt,color clr,int fsize,bool bold=false)
    ObjectSetInteger(0,n,OBJPROP_ZORDER,10); Track(n);
 }
 
-//----------------------------------------------------------------------
-//  Btn — căn giữa chữ theo chiều ngang dựa trên pixel thực
-//  avgCharW: ước lượng pixel/ký tự ở font size fsize (Arial Bold)
-//  MT5 không expose text-width API → dùng heuristic: ~0.6 * fsize * scale
-//  Tốt hơn nhiều so với StringLen(txt)*fsize cố định
-//----------------------------------------------------------------------
 void Btn(string n,int x,int y,int w,int h,string txt,color bg,color clr,int fsize)
 {
    Rect(n+"_bg",x,y,w,h,bg,C_BDR2,1);
+   ObjectSetInteger(0,n+"_bg",OBJPROP_SELECTABLE,true);
+   ObjectSetInteger(0,n+"_bg",OBJPROP_ZORDER,19);
    ObjectCreate(0,n,OBJ_LABEL,0,0,0);
-
-   // Ước lượng chiều rộng text: 0.65 pixel/unit/fontsize (Arial Bold)
-   int textW = (int)(StringLen(txt) * fsize * 0.65);
-   int offX  = MathMax(2, (w - textW) / 2);
-   int offY  = MathMax(1, (h - fsize*2) / 2 + 1);
-
-   ObjectSetInteger(0,n,OBJPROP_XDISTANCE, x + offX);
-   ObjectSetInteger(0,n,OBJPROP_YDISTANCE, y + offY);
+   int textW=(int)(StringLen(txt)*fsize*0.65);
+   int offX=MathMax(2,(w-textW)/2);
+   int offY=MathMax(1,(h-fsize*2)/2+1);
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x+offX);
+   ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y+offY);
    ObjectSetString(0,n,OBJPROP_TEXT,txt);    ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
    ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fsize); ObjectSetString(0,n,OBJPROP_FONT,"Arial Bold");
    ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER);
@@ -764,373 +1743,299 @@ void ObjW(string n,int v)       { ObjectSetInteger(0,n,OBJPROP_XSIZE,v); }
 void ObjBg(string n,color v)    { ObjectSetInteger(0,n,OBJPROP_BGCOLOR,v); ObjectSetInteger(0,n,OBJPROP_COLOR,v); }
 void ObjVis(string n,bool v)    { ObjectSetInteger(0,n,OBJPROP_TIMEFRAMES,v?OBJ_ALL_PERIODS:OBJ_NO_PERIODS); }
 
+void EnsureCrossLabel(string n,int x,int y,string txt,color clr,int fsize)
+{
+   if(ObjectFind(0,n)<0)
+   {
+      ObjectCreate(0,n,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,n,OBJPROP_CORNER,CORNER_LEFT_UPPER);
+      ObjectSetInteger(0,n,OBJPROP_BACK,false);
+      ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,n,OBJPROP_ZORDER,30);
+      ObjectSetString(0,n,OBJPROP_FONT,"Arial Bold");
+      Track(n);
+   }
+   ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x);
+   ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fsize);
+   ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetString(0,n,OBJPROP_TEXT,txt);
+   ObjectSetInteger(0,n,OBJPROP_TIMEFRAMES,gHidden?OBJ_NO_PERIODS:OBJ_ALL_PERIODS);
+}
+
+void EnsureCrossBadge(int idx,int x,int y,string txt,bool bullish,int fsize)
+{
+   string bg=StringFormat("d_cross_bg%d",idx);
+   string lb=StringFormat("d_cross_px%d",idx);
+   int padX=sz(4), padY=sz(2);
+   int w=MathMax(sz(42),(int)(StringLen(txt)*(fsize*0.70))+padX*2);
+   int h=fsize+padY*2+sz(2);
+   color bd=bullish?C_GREEN:C_RED;
+   color bgc=bullish?C'10,28,18':C'32,12,12';
+
+   if(ObjectFind(0,bg)<0)
+   {
+      ObjectCreate(0,bg,OBJ_RECTANGLE_LABEL,0,0,0);
+      ObjectSetInteger(0,bg,OBJPROP_CORNER,CORNER_LEFT_UPPER);
+      ObjectSetInteger(0,bg,OBJPROP_BACK,false);
+      ObjectSetInteger(0,bg,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,bg,OBJPROP_BORDER_TYPE,BORDER_FLAT);
+      ObjectSetInteger(0,bg,OBJPROP_ZORDER,29);
+      Track(bg);
+   }
+   ObjectSetInteger(0,bg,OBJPROP_XDISTANCE,x);
+   ObjectSetInteger(0,bg,OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,bg,OBJPROP_XSIZE,w);
+   ObjectSetInteger(0,bg,OBJPROP_YSIZE,h);
+   ObjectSetInteger(0,bg,OBJPROP_BGCOLOR,bgc);
+   ObjectSetInteger(0,bg,OBJPROP_COLOR,bd);
+   ObjectSetInteger(0,bg,OBJPROP_TIMEFRAMES,gHidden?OBJ_NO_PERIODS:OBJ_ALL_PERIODS);
+
+   EnsureCrossLabel(lb,x+padX,y+padY,txt,bd,fsize);
+}
+
 //======================================================================
-//  BUILD PANEL — mọi kích thước tự động theo DASH_SCALE
+//  UPDATE AUTO ENTRY BUTTON
+//======================================================================
+void UpdateAutoEntryBtn()
+{
+   string lbl  = gAutoEntry ? "AUTO ENTRY: ON " : "AUTO ENTRY: OFF";
+   color  clr  = gAutoEntry ? C_GREEN           : C_RED;
+   color  bg   = gAutoEntry ? C'14,36,24'       : C'36,14,14';
+   ObjTxt("d_btn_ae", lbl);
+   ObjClr("d_btn_ae", clr);
+   ObjectSetInteger(0,"d_btn_ae_bg",OBJPROP_BGCOLOR,bg);
+   ObjectSetInteger(0,"d_btn_ae_bg",OBJPROP_COLOR,  clr);
+}
+
+//======================================================================
+//  BUILD PANEL
 //======================================================================
 void BuildPanel()
 {
    ObjDeleteAll();
-   int px = InpPanelX;
-   int py = InpPanelY;
+   int px=InpPanelX, py=InpPanelY;
 
-   // ════════════════════════════════════════════════════════════
-   //  KẾT HỢP KÍCH THƯỚC — runtime, tất cả qua sz()/fs()
-   // ════════════════════════════════════════════════════════════
+   int cPW=PanelW();
+   int cH=sz(90);
+   int cMH=sz(MARGIN_H);
+   int row1=py+sz(8);
+   int row2=py+sz(34);
+   int row3=py+sz(62);
+   int fHead=fs(10), fBody=fs(8), fVal=fs(9), fBtn=fs(8);
 
-   int PW_       = sz(PW_BASE);         // chiều rộng panel
-   int MH        = sz(MARGIN_H);        // margin ngang
+   Rect("d_sh",px+3,py+3,cPW,cH,C'6,8,14',C'6,8,14',0);
+   Rect("d_bg",px,py,cPW,cH,C_BG,C_BDR2,1);
+   Rect("d_hdr_line",px,py,cPW,2,C_GOLD,C_GOLD,0);
 
-   // Chiều cao các khối
-   int HDR_H     = sz(H_HDR);
-   int CRD_H     = sz(H_CRD);
-   int SL_H      = sz(H_SL);
-   int CD_H      = sz(H_CD);
-   int BT_H      = sz(H_BT);
-   int RLOG_     = sz(H_RLOG);
-   int FT_H      = sz(H_FT);
-   int EMA_ACC   = sz(H_EMA_ACC);
-   int EMA_SH    = sz(H_EMA_SH);
-   int EMA_CV    = CanvasH();           // runtime, = sz(160)
-   int EMA_CTRL  = sz(H_EMA_CTRL);
-   int EMA_SIG   = sz(H_EMA_SIG);
-   int EMA_RSN   = sz(H_EMA_RSN);
-   int EMA_SB    = sz(H_EMA_SB);
-   int EMA_PAD   = sz(H_EMA_PAD);
-   int EMA_CARD  = EmaCardH();          // tổng chiều cao card EMA
+   Lbl("d_hdr_title",px+cMH,row1,"AUTO SL M5",C_GOLD,fHead,true);
+   Lbl("d_hdr_sym",px+sz(95),row1,gSym,C_WHITE,fHead,true);
+   Lbl("d_hdr_status",px+sz(190),row1,"[RUNNING]",C_GREEN,fVal,true);
+   Btn("d_btn_ae",px+sz(292),py+sz(6),sz(132),sz(22),gAutoEntry?"AUTO ENTRY: ON":"AUTO ENTRY: OFF",
+       gAutoEntry?C'14,36,24':C'36,14,14',gAutoEntry?C_GREEN:C_RED,fBtn);
+   Btn("d_btn_candle",px+sz(430),py+sz(6),sz(104),sz(22),"ANALYZE "+(string)gAnalysisDays+"D",C'14,22,34',C_CYAN,fBtn);
+   Btn("d_btn_limit",px+sz(540),py+sz(6),sz(74),sz(22),"LIMIT",C'16,28,20',C_GREEN,fBtn);
 
-   // Gaps
-   int G_HDR_OV  = sz(GAP_HDR_OV);
-   int G_LBL     = sz(GAP_SECT_LBL);
-   int G_CRD_EMA = sz(GAP_CRD_EMA);
-   int G_EMA_SL  = sz(GAP_EMA_SL);
-   int G_SLC     = sz(GAP_SLC);
-   int G_CD_BT   = sz(GAP_CD_BT);
-   int G_BT_LOG  = sz(GAP_BT_LOG);
-   int G_LOG_FT  = sz(GAP_LOG_FT);
+   Lbl("d_sig_lbl",px+sz(624),row1,"Signal:",C_MUTED,fBody);
+   Lbl("d_ema_sgv",px+sz(671),row1,"WAIT",C_ORANGE,fVal,true);
+   Lbl("d_trend_lbl",px+sz(732),row1,"Trend:",C_MUTED,fBody);
+   Lbl("d_ema_trv",px+sz(779),row1,"SIDEWAY",C_ORANGE,fVal,true);
+   Lbl("d_score_lbl",px+sz(870),row1,"Score:",C_MUTED,fBody);
+   Lbl("d_ema_score_v",px+sz(916),row1,"50",C_ORANGE,fVal,true);
+   Lbl("d_hdr_clock",px+cPW-sz(142),row1,"",C_MUTED,fBody);
+   Btn("d_btn_hide",px+cPW-sz(52),py+sz(6),sz(46),sz(22),"[ X ]",C_CARD,C_CYAN,fBtn);
 
-   // Font sizes
-   int F_HDR     = fs(10);
-   int F_SECT    = fs(7);
-   int F_CLBL    = fs(7);
-   int F_CVAL    = fs(18);
-   int F_CVAL2   = fs(14);
-   int F_BODY    = fs(8);
-   int F_VAL     = fs(9);
-   int F_BTN     = fs(9);
+   Lbl("d_plan_txt",px+cMH,row2,"Entry: ---",C_MUTED,fBody,true);
+   Lbl("d_risk_txt",px+sz(250),row2,"SL/TP: ---",C_MUTED,fBody,true);
+   Lbl("d_stat_pos",px+sz(470),row2,"Pos: 0",C_WHITE,fBody,true);
+   Lbl("d_stat_pnl",px+sz(545),row2,"PnL: +0.00",C_MUTED,fBody,true);
+   Lbl("d_ae_last",px+sz(650),row2,"Last: ---",C_MUTED2,fBody);
+   Lbl("d_line_txt",px+sz(765),row2,"Ready",C_MUTED,fBody);
 
-   // Card width: 4 cột, gap giữa, margin 2 bên
-   // Tổng: 4*CRD_W + 3*CARD_GAP + 2*MH/2 = PW_
-   int cg_       = sz(CARD_GAP);
-   int CRD_W     = (PW_ - MH - cg_*3) / 4;   // chia 4 đều
+   Lbl("d_ctl_ema",px+cMH,row3,"EMA",C_MUTED,fBody,true);
+   Btn("d_btn_f_dec",px+sz(46),row3-sz(4),sz(20),sz(18),"-",C'28,18,18',C_RED,fBtn);
+   Lbl("d_ema_fval",px+sz(70),row3,(string)gEmaFast,C_YELLOW,fBody,true);
+   Btn("d_btn_f_inc",px+sz(98),row3-sz(4),sz(20),sz(18),"+",C'16,30,20',C_GREEN,fBtn);
+   Btn("d_btn_m_dec",px+sz(132),row3-sz(4),sz(20),sz(18),"-",C'28,18,18',C_RED,fBtn);
+   Lbl("d_ema_mval",px+sz(156),row3,(string)gEmaMid,C_CYAN,fBody,true);
+   Btn("d_btn_m_inc",px+sz(184),row3-sz(4),sz(20),sz(18),"+",C'16,30,20',C_GREEN,fBtn);
+   Btn("d_btn_s_dec",px+sz(218),row3-sz(4),sz(20),sz(18),"-",C'28,18,18',C_RED,fBtn);
+   Lbl("d_ema_sval",px+sz(242),row3,(string)gEmaSlow,C_ORANGE,fBody,true);
+   Btn("d_btn_s_inc",px+sz(278),row3-sz(4),sz(20),sz(18),"+",C'16,30,20',C_GREEN,fBtn);
 
-   // ════════════════════════════════════════════════════════════
-   //  TÍNH TỔNG CHIỀU CAO (từ trên xuống, đúng thứ tự vẽ)
-   //
-   //  py
-   //  + HDR_H              header
-   //  + G_HDR_OV           gap header → Overview label
-   //  + G_LBL              Overview label
-   //  + CRD_H              4 cards
-   //  + G_CRD_EMA          gap cards → EMA label
-   //  + G_LBL              EMA label
-   //  + EMA_CARD           card EMA đầy đủ
-   //  + G_EMA_SL           gap EMA → SL label
-   //  + G_LBL              SL label
-   //  + SL_H               2 cards SL/Close
-   //  + G_SLC              gap SL → countdown
-   //  + CD_H               countdown bar
-   //  + G_CD_BT            gap countdown → batch
-   //  + BT_H               batch bar
-   //  + G_BT_LOG           gap batch → log label
-   //  + G_LBL              log label
-   //  + InpMaxLog*RLOG_+sz(8)  log area
-   //  + G_LOG_FT           gap log → footer
-   //  + FT_H               footer
-   // ════════════════════════════════════════════════════════════
-   int totH = HDR_H + G_HDR_OV + G_LBL + CRD_H
-            + G_CRD_EMA + G_LBL + EMA_CARD
-            + G_EMA_SL  + G_LBL + SL_H
-            + G_SLC + CD_H + G_CD_BT + BT_H
-            + G_BT_LOG + G_LBL + InpMaxLog*RLOG_ + sz(8)
-            + G_LOG_FT + FT_H;
+   Lbl("d_ctl_days",px+sz(330),row3,"M5 Days",C_MUTED,fBody,true);
+   Btn("d_btn_d_dec",px+sz(392),row3-sz(4),sz(22),sz(18),"-",C'28,18,18',C_RED,fBtn);
+   Lbl("d_days_val",px+sz(420),row3,(string)gAnalysisDays+"D",C_CYAN,fBody,true);
+   Btn("d_btn_d_inc",px+sz(456),row3-sz(4),sz(22),sz(18),"+",C'16,30,20',C_GREEN,fBtn);
+   Lbl("d_ctl_hint",px+sz(500),row3,"Markers: EMA crosses + Entry/SL/TP points",C_MUTED2,fBody);
 
-   // Shadow + background
-   Rect("d_sh", px+3, py+3, PW_, totH, C'6,8,14', C'6,8,14', 0);
-   Rect("d_bg", px,   py,   PW_, totH, C_BG, C_BDR2, 1);
+   ChartRedraw(0);
+   return;
 
-   // ════════════════════════════════════════════════════════════
-   //  HEADER
-   //  Layout (trái → phải):
-   //  [title] | [symbol]   [status]   [S][M][L][XL]  [X]
-   // ════════════════════════════════════════════════════════════
-   Rect("d_hdr_bg",   px,py,       PW_,HDR_H, C_HDR,  C_BDR2, 0);
-   Rect("d_hdr_line", px,py,       PW_,2,     C_GOLD, C_GOLD, 0);
-   Lbl("d_hdr_title", px+MH+sz(4), py+sz(11), "Auto tracking",  C_GOLD,  F_HDR, true);
-   Lbl("d_hdr_pipe",  px+sz(100),  py+sz(12), "|",              C_MUTED2,F_BODY);
-   Lbl("d_hdr_sym",   px+sz(110),  py+sz(11), gSym,             C_WHITE, F_HDR, true);
-   Lbl("d_hdr_status",px+PW_/2-sz(36), py+sz(11), "[RUNNING]",  C_GREEN, F_VAL, true);
+   int PW_      = sz(PW_BASE);
+   int MH       = sz(MARGIN_H);
+   int HDR_H    = sz(H_HDR);
+   int AE_H     = sz(H_AE_BAR);
+   int FT_H     = sz(H_FT);
+   int EMA_ACC  = sz(H_EMA_ACC);
+   int EMA_SH   = sz(H_EMA_SH);
+   int EMA_CV   = CanvasH();
+   int EMA_CTRL = sz(34);
+   int EMA_SIG  = sz(H_EMA_SIG);
+   int EMA_RSN  = sz(H_EMA_RSN);
+   int EMA_SB   = sz(H_EMA_SB);
+   int EMA_CARD = EMA_ACC + EMA_SH + EMA_CV + sz(6) + EMA_CTRL + sz(4) + EMA_SIG + EMA_RSN + EMA_SB + sz(16);
+   int G_HDR_OV = sz(10);
+   int G_LBL    = sz(8);
+   int G_FT     = sz(10);
+   int F_HDR    = fs(10);
+   int F_SECT   = fs(7);
+   int F_BODY   = fs(8);
+   int F_VAL    = fs(9);
+   int F_BTN    = fs(9);
 
-   // --- Scale buttons: 4 nút [ S ][ M ][ L ][ XL ] ---
-   // Đặt sát bên trái nút [ X ], mỗi nút rộng 22px (base), cao 20px, gap 3px
-   int scBtnW  = sz(22);   // chiều rộng mỗi nút scale
-   int scBtnH  = sz(20);   // chiều cao nút scale
-   int scBtnGp = sz(3);    // gap giữa các nút
-   int scBtnY  = py + (HDR_H - scBtnH) / 2;   // canh giữa theo chiều cao header
-   int hideW   = sz(50);   // chiều rộng nút [ X ]
-   int hideGap = sz(4);    // gap giữa nhóm scale và nút X
+   int statH = sz(28);
+   int lineH = sz(18);
+   int totH = HDR_H + AE_H + G_HDR_OV + G_LBL + EMA_CARD + sz(8) + statH + lineH + G_FT + FT_H;
 
-   // Nút [ X ] — giữ nguyên, chỉ tính lại X để nhường chỗ scale buttons
-   int hideX = px + PW_ - hideW - sz(4);
-   Btn("d_btn_hide", hideX, scBtnY, hideW, scBtnH, "[ X ]", C_CARD, C_CYAN, F_BTN);
+   Rect("d_sh",px+3,py+3,PW_,totH,C'6,8,14',C'6,8,14',0);
+   Rect("d_bg",px,  py,  PW_,totH,C_BG,     C_BDR2,   1);
 
-   // Nhóm 4 nút scale — nằm sát bên trái nút X
-   // Thứ tự phải → trái: XL, L, M, S
-   string scIds[4]   = {"d_btn_sc_xl","d_btn_sc_l","d_btn_sc_m","d_btn_sc_s"};
-   string scLabels[4]= {"XL","L","M","S"};
-   int    scVals[4]  = {150,120,100,80};
+   // ── HEADER ──────────────────────────────────────────────
+   Rect("d_hdr_bg",   px,py,     PW_,HDR_H,C_HDR,  C_BDR2,0);
+   Rect("d_hdr_line", px,py,     PW_,2,    C_GOLD, C_GOLD, 0);
+   Lbl("d_hdr_title", px+MH+sz(4),py+sz(11),"M5 Signal",      C_GOLD,  F_HDR,true);
+   Lbl("d_hdr_pipe",  px+sz(82),  py+sz(12),"|",              C_MUTED2,F_BODY);
+   Lbl("d_hdr_sym",   px+sz(92),  py+sz(11),gSym,             C_WHITE, F_HDR,true);
+   Lbl("d_hdr_status",px+PW_/2-sz(40),py+sz(11),"[RUNNING]",  C_GREEN, F_VAL,true);
+   Lbl("d_hdr_clock", px+PW_-sz(228),py+sz(12),"",            C_MUTED, F_BODY);
 
-   for(int i=0;i<4;i++)
-   {
-      int bx = hideX - hideGap - (i+1)*(scBtnW+scBtnGp) + scBtnGp;
-      // Nút active (scale hiện tại) highlight vàng
-      bool isActive = (scVals[i] == gDashScale);
-      color btnBg  = isActive ? C'30,38,56' : C_CARD;
-      color btnClr = isActive ? C_GOLD      : C_MUTED;
-      Btn(scIds[i], bx, scBtnY, scBtnW, scBtnH, scLabels[i], btnBg, btnClr, F_BTN);
-      // Active indicator: đường vàng dưới nút
-      if(isActive)
-         Rect(scIds[i]+"_act", bx, scBtnY+scBtnH-2, scBtnW, 2, C_GOLD, C_GOLD, 0);
+   int scBtnW=sz(22),scBtnH=sz(20),scBtnGp=sz(3);
+   int scBtnY=py+(HDR_H-scBtnH)/2;
+   int hideW=sz(50),hideGap=sz(4);
+   int hideX=px+PW_-hideW-sz(4);
+   Btn("d_btn_hide",hideX,scBtnY,hideW,scBtnH,"[ X ]",C_CARD,C_CYAN,F_BTN);
+   string scIds[4]   ={"d_btn_sc_xl","d_btn_sc_l","d_btn_sc_m","d_btn_sc_s"};
+   string scLabels[4]={"XL","L","M","S"};
+   int    scVals[4]  ={150,120,100,80};
+   for(int i=0;i<4;i++){
+      int bx=hideX-hideGap-(i+1)*(scBtnW+scBtnGp)+scBtnGp;
+      bool isActive=(scVals[i]==gDashScale);
+      Btn(scIds[i],bx,scBtnY,scBtnW,scBtnH,scLabels[i],
+          isActive?C'30,38,56':C_CARD, isActive?C_GOLD:C_MUTED, F_BTN);
+      if(isActive) Rect(scIds[i]+"_act",bx,scBtnY+scBtnH-2,scBtnW,2,C_GOLD,C_GOLD,0);
+   }
+   int scLblX=hideX-hideGap-4*(scBtnW+scBtnGp)+scBtnGp-sz(26);
+   Lbl("d_hdr_sizelbl",scLblX,py+sz(12),"SIZE:",C_MUTED2,F_BODY);
+
+   // ── AUTO ENTRY BAR ──────────────────────────────────────
+   int aeBarY = py + HDR_H;
+   color aeBg  = gAutoEntry ? C'14,36,24' : C'24,16,16';
+   color aeClr = gAutoEntry ? C_GREEN     : C_RED;
+   Rect("d_ae_bar",px,aeBarY,PW_,AE_H, aeBg, gAutoEntry?C_GREEN:C_RED, 0);
+
+   int aeBtnW = sz(148);
+   int aeBtnH = AE_H - sz(4);
+   int aeBtnY = aeBarY + sz(2);
+   string aeLbl = gAutoEntry ? "AUTO ENTRY: ON " : "AUTO ENTRY: OFF";
+   Btn("d_btn_ae", px+sz(6), aeBtnY, aeBtnW, aeBtnH, aeLbl, aeBg, aeClr, F_BTN);
+
+   Lbl("d_ae_lot",  px+sz(162), aeBarY+sz(7),
+       StringFormat("Lot:%.2f",InpLotSize), C_MUTED, F_BODY);
+   Lbl("d_ae_tp",   px+sz(236), aeBarY+sz(7),
+       InpTP_Points>0?StringFormat("TP:%.0fpt",InpTP_Points):"TP:---", C_MUTED, F_BODY);
+   Lbl("d_ae_cd",   px+sz(310), aeBarY+sz(7),
+       StringFormat("CD:%d bars",InpCrossCooldownBars), C_MUTED, F_BODY);
+   Lbl("d_ae_last", px+PW_-sz(130), aeBarY+sz(7), "Last: ---", C_MUTED2, F_BODY);
+
+   // ── EMA CARD ────────────────────────────────────────────
+   int by  = py + HDR_H + AE_H + G_HDR_OV;
+   int eby = by+G_LBL;
+   Lbl("d_s_ema",px+MH+sz(2),by,
+       StringFormat("EMA M5  (%d / %d / %d)",gEmaFast,gEmaMid,gEmaSlow),
+       C_MUTED,F_SECT);
+   int ema_inner_w=PW_-MH;
+   Rect("d_ema_bg", px+MH/2,eby,ema_inner_w,EMA_CARD,C_CARD, C_BDR);
+   Rect("d_ema_top",px+MH/2,eby,ema_inner_w,EMA_ACC, C_GOLD2,C_GOLD2,0);
+   int esh_y=eby+EMA_ACC;
+   Rect("d_ema_sh",px+MH/2,esh_y,ema_inner_w,EMA_SH,C_CARD2,C_BDR,0);
+   Lbl("d_ema_shl",px+MH+sz(4),esh_y+sz(8),
+       StringFormat("M5  %d / %d / %d",gEmaFast,gEmaMid,gEmaSlow),C_MUTED,F_BODY);
+   int ldx=px+sz(115);
+   Rect("d_leg_f",ldx,       esh_y+sz(9),sz(6),sz(6),C_YELLOW,C_YELLOW,0);
+   Rect("d_leg_m",ldx+sz(22),esh_y+sz(9),sz(6),sz(6),C_CYAN,  C_CYAN,  0);
+   Rect("d_leg_s",ldx+sz(44),esh_y+sz(9),sz(6),sz(6),C_ORANGE,C_ORANGE,0);
+   Lbl("d_leg_fl",ldx+sz(8), esh_y+sz(8),"F",C_YELLOW,F_BODY,true);
+   Lbl("d_leg_ml",ldx+sz(30),esh_y+sz(8),"M",C_CYAN,  F_BODY,true);
+   Lbl("d_leg_sl",ldx+sz(52),esh_y+sz(8),"S",C_ORANGE,F_BODY,true);
+   Lbl("d_ema_shbdg",px+PW_-sz(132),esh_y+sz(8),"ANALYZING...",C_ORANGE,F_VAL,true);
+   int ecv_y=esh_y+EMA_SH;
+   Rect("d_ema_cvbrd",px+sz(MARGIN_H)-1,ecv_y,CanvasW()+2,EMA_CV+2,C'5,9,17',C_BDR2,1);
+   int ovW=sz(196), ovH=sz(58);
+   int ovX=px+MH/2+(ema_inner_w-ovW)/2;
+   int ovY=ecv_y+(EMA_CV-ovH)/2;
+   Rect("d_mid_bg",ovX,ovY,ovW,ovH,C'5,9,17',C_BDR2,1);
+   Lbl("d_mid_signal",ovX+sz(58),ovY+sz(6),"WAIT",C_ORANGE,fs(13),true);
+   Lbl("d_mid_trend", ovX+sz(54),ovY+sz(24),"SIDEWAY",C_MUTED,fs(9),true);
+   Lbl("d_mid_meta",  ovX+sz(26),ovY+sz(40),"Score 50 | ---",C_MUTED,F_BODY);
+
+   int cty=ecv_y+EMA_CV+sz(6);
+   Rect("d_ema_ctrl",px+MH/2,cty,ema_inner_w,EMA_CTRL,C_CARD2,C_BDR,0);
+   int grpW=ema_inner_w/3;
+   string grpId[3]={"f","m","s"};
+   color  grpClr[3]={C_YELLOW,C_CYAN,C_ORANGE};
+   int    grpVal[3]={gEmaFast,gEmaMid,gEmaSlow};
+   string grpLbl[3]={"Fast","Mid","Slow"};
+   int btnW=sz(24),btnH=sz(22);
+   for(int i=0;i<3;i++){
+      int gx=px+MH/2+grpW*i+sz(6);
+      int gy=cty+(EMA_CTRL-btnH)/2;
+      Lbl("d_ema_"+grpId[i]+"lbl",gx,cty+sz(10),grpLbl[i],C_MUTED,F_BODY);
+      Btn("d_btn_"+grpId[i]+"_dec",gx+sz(40),gy,btnW,btnH,"-",C'28,18,18',C_RED,F_VAL);
+      Rect("d_ema_"+grpId[i]+"box",gx+sz(68),gy,sz(34),btnH,C'10,14,22',C_BDR,1);
+      Lbl("d_ema_"+grpId[i]+"val",gx+sz(79),cty+sz(8),(string)grpVal[i],grpClr[i],F_VAL,true);
+      Btn("d_btn_"+grpId[i]+"_inc",gx+sz(108),gy,btnW,btnH,"+",C'16,30,20',C_GREEN,F_VAL);
    }
 
-   // Label nhỏ "SIZE" phía bên trái nhóm nút
-   int scLblX = hideX - hideGap - 4*(scBtnW+scBtnGp) + scBtnGp - sz(26);
-   Lbl("d_hdr_sizelbl", scLblX, py+sz(12), "SIZE:", C_MUTED2, F_BODY);
+   int sry=cty+EMA_CTRL+sz(4);
+   Rect("d_ema_sig_bg",px+MH/2,sry,ema_inner_w,EMA_SIG,C_CARD2,C_BDR,0);
+   int sigColW=ema_inner_w/4;
+   int col0=px+MH/2+sz(8),col1=px+MH/2+sigColW,col2=px+MH/2+sigColW*2,col3=px+MH/2+sigColW*3;
+   Lbl("d_ema_trl",col0,        sry+sz(5),"TREND",    C_MUTED,F_BODY);
+   Lbl("d_ema_trv",col0+sz(44), sry+sz(4),"---",      C_ORANGE,F_VAL,true);
+   Lbl("d_ema_sgl",col1,        sry+sz(5),"SIGNAL",   C_MUTED,F_BODY);
+   Lbl("d_ema_sgv",col1+sz(48), sry+sz(4),"WAIT",     C_ORANGE,F_VAL,true);
+   Lbl("d_ema_stl",col2,        sry+sz(5),"STR",      C_MUTED,F_BODY);
+   Lbl("d_ema_stv",col2+sz(28), sry+sz(4),"---",      C_MUTED,F_VAL,true);
+   Lbl("d_ema_sc_l",col3,       sry+sz(5),"SCORE",    C_MUTED,F_BODY);
+   Lbl("d_ema_score_v",col3+sz(40),sry+sz(4),"50",    C_ORANGE,F_VAL,true);
+   int rsy=sry+EMA_SIG;
+   Lbl("d_ema_rsn",px+MH+sz(4),rsy+sz(2),"...",C_MUTED,F_BODY);
+   int sbY=eby+EMA_CARD-EMA_SB-sz(2);
+   Rect("d_sbar_bg",  px+MH/2,sbY,ema_inner_w,EMA_SB,C_CARD2,C_CARD2,0);
+   Rect("d_sbar_fill",px+MH/2,sbY,0,          EMA_SB,C_GREEN,C_GREEN,0);
 
-   // ════════════════════════════════════════════════════════════
-   //  SECTION A: 4 METRIC CARDS
-   // ════════════════════════════════════════════════════════════
-   int ay  = py + HDR_H + G_HDR_OV;    // Y label "OVERVIEW"
-   int cy_ = ay + G_LBL;               // Y bắt đầu 4 card
+   // ── COMPACT STATS ───────────────────────────────────────
+   int sty = eby + EMA_CARD + sz(8);
+   Rect("d_stat_bg",px+MH/2,sty,ema_inner_w,statH,C_CARD2,C_BDR);
+   Lbl("d_stat_pos",px+MH+sz(4),sty+sz(6),"Pos: 0",C_WHITE,F_BODY,true);
+   Lbl("d_stat_pnl",px+sz(112),sty+sz(6),"PnL: +0.00",C_MUTED,F_BODY,true);
+   Lbl("d_stat_sl", px+sz(236),sty+sz(6),"SL B:--- | S:---",C_CYAN,F_BODY,true);
+   Lbl("d_stat_lv", px+sz(380),sty+sz(6),"M5: --- / ---",C_MUTED,F_BODY);
 
-   color cardAccent[4] = {C_BLUE, C_GREEN, C_CYAN, C_PURPLE};
-   string cardId[4]    = {"c1","c2","c3","c4"};
-   string cardLbl[4]   = {"POSITIONS","TOTAL P&L","SL SET","BREAKEVEN"};
-   string cardVal[4]   = {"0","+0.00","0","0"};
-   string cardSub[4]   = {"lenh mo","USD","lenh OK","locked"};
-   color  cardVc[4]    = {C_WHITE, C_GREEN, C_CYAN, C_PURPLE};
-   int    cardFs[4]    = {F_CVAL, F_CVAL2, F_CVAL, F_CVAL};
+   int lny = sty + statH + sz(6);
+   Rect("d_line_bg",px+MH/2,lny,ema_inner_w,lineH,C'8,12,20',C_BDR);
+   Lbl("d_line_txt",px+MH+sz(4),lny+sz(4),"Ready",C_MUTED,F_BODY);
 
-   Lbl("d_s_ov", px+MH+sz(2), ay, "OVERVIEW", C_MUTED, F_SECT);
-
-   for(int i=0;i<4;i++)
-   {
-      int cx_i = px + MH/2 + (CRD_W + cg_)*i;
-      Rect("d_"+cardId[i],    cx_i, cy_, CRD_W, CRD_H, C_CARD,        C_BDR);
-      Rect("d_"+cardId[i]+"t",cx_i, cy_, CRD_W, 2,     cardAccent[i], cardAccent[i],0);
-      Lbl("d_"+cardId[i]+"l", cx_i+sz(6), cy_+sz(9),        cardLbl[i], C_MUTED,   F_CLBL);
-      Lbl("d_"+cardId[i]+"v", cx_i+sz(6), cy_+sz(21),       cardVal[i], cardVc[i], cardFs[i], true);
-      Lbl("d_"+cardId[i]+"s", cx_i+sz(6), cy_+CRD_H-sz(12), cardSub[i], C_MUTED,  F_CLBL);
-   }
-
-   // ════════════════════════════════════════════════════════════
-   //  SECTION B: EMA CHART CARD
-   //  Lưu ý: các Y ở đây PHẢI khớp với CalcCanvasScreenY()
-   // ════════════════════════════════════════════════════════════
-   int by  = cy_ + CRD_H + G_CRD_EMA;  // Y label "EMA ANALYSIS"
-   int eby = by  + G_LBL;              // Y outer card EMA
-
-   Lbl("d_s_ema", px+MH+sz(2), by,
-       StringFormat("EMA ANALYSIS  —  M5  ( %d / %d / %d )",gEmaFast,gEmaMid,gEmaSlow),
-       C_MUTED, F_SECT);
-
-   // Outer card
-   int ema_inner_w = PW_ - MH;           // PW_ - 2*MH/2 (trái+phải)
-   Rect("d_ema_bg",  px+MH/2, eby, ema_inner_w, EMA_CARD, C_CARD, C_BDR);
-   Rect("d_ema_top", px+MH/2, eby, ema_inner_w, EMA_ACC,  C_GOLD2,C_GOLD2,0);
-
-   // Sub-header
-   int esh_y = eby + EMA_ACC;
-   Rect("d_ema_sh", px+MH/2, esh_y, ema_inner_w, EMA_SH, C_CARD2, C_BDR, 0);
-   Lbl("d_ema_shl", px+MH+sz(4), esh_y+sz(8),
-       StringFormat("M5  %d / %d / %d",gEmaFast,gEmaMid,gEmaSlow), C_MUTED, F_BODY);
-
-   // Legend dots
-   int ldx = px + sz(115);
-   Rect("d_leg_f", ldx,        esh_y+sz(9), sz(6),sz(6), C_YELLOW,C_YELLOW,0);
-   Rect("d_leg_m", ldx+sz(22), esh_y+sz(9), sz(6),sz(6), C_CYAN,  C_CYAN,  0);
-   Rect("d_leg_s", ldx+sz(44), esh_y+sz(9), sz(6),sz(6), C_ORANGE,C_ORANGE,0);
-   Lbl("d_leg_fl",  ldx+sz(8),  esh_y+sz(8), "F", C_YELLOW,F_BODY,true);
-   Lbl("d_leg_ml",  ldx+sz(30), esh_y+sz(8), "M", C_CYAN,  F_BODY,true);
-   Lbl("d_leg_sl",  ldx+sz(52), esh_y+sz(8), "S", C_ORANGE,F_BODY,true);
-
-   // Trend badge — căn phải, cách mép sz(12)
-   Lbl("d_ema_shbdg", px+PW_-sz(120), esh_y+sz(8), "ANALYZING...", C_ORANGE, F_VAL, true);
-
-   // Viền canvas: đặt tại cùng X, Y với InitCanvas, +1px mỗi bên
-   int ecv_y = esh_y + EMA_SH;   // ← đây là ecv_y, khớp CalcCanvasScreenY()
-   int cvBrdX = px + sz(MARGIN_H) - 1;
-   int cvBrdW = CanvasW() + 2;
-   Rect("d_ema_cvbrd", cvBrdX, ecv_y, cvBrdW, EMA_CV+2, C'5,9,17', C_BDR2, 1);
-
-   // Controls +/- EMA periods
-   int cty = ecv_y + EMA_CV + sz(4);
-   Rect("d_ema_ctrl", px+MH/2, cty, ema_inner_w, EMA_CTRL, C_CARD2, C_BDR, 0);
-
-   // 3 groups chia đều trong ema_inner_w trừ vùng SCORE sz(90) bên phải
-   int scoreW   = sz(90);
-   int grpsW    = ema_inner_w - scoreW;
-   int grpW     = grpsW / 3;
-   string grpId[3]  = {"f","m","s"};
-   color  grpClr[3] = {C_YELLOW, C_CYAN, C_ORANGE};
-   int    grpVal[3] = {gEmaFast, gEmaMid, gEmaSlow};
-   string grpLbl[3] = {"F:","M:","S:"};
-
-   int btnW = sz(17), btnH = sz(16);
-   for(int i=0;i<3;i++)
-   {
-      int gx = px + MH/2 + sz(6) + grpW*i;
-      int gvy = cty + (EMA_CTRL - btnH) / 2;  // vertically centred in ctrl bar
-
-      Rect("d_ema_"+grpId[i]+"_dot", gx,       cty+sz(9), sz(7),sz(7),   grpClr[i],grpClr[i],0);
-      Lbl("d_ema_"+grpId[i]+"l2",    gx+sz(10), cty+sz(6), grpLbl[i],    C_MUTED,  F_BODY);
-      Lbl("d_ema_"+grpId[i]+"val",   gx+sz(28), cty+sz(5), (string)grpVal[i], grpClr[i], F_VAL, true);
-      Btn("d_btn_"+grpId[i]+"_dec",  gx+sz(58), gvy,       btnW,btnH, "-", C_CARD, C_RED,   F_BTN);
-      Btn("d_btn_"+grpId[i]+"_inc",  gx+sz(78), gvy,       btnW,btnH, "+", C_CARD, C_GREEN, F_BTN);
-   }
-
-   // SCORE — căn phải trong ctrl bar
-   int scX = px + MH/2 + ema_inner_w - scoreW + sz(4);
-   Lbl("d_ema_sc_l",    scX,        cty+sz(6), "SCORE:", C_MUTED,  F_BODY);
-   Lbl("d_ema_score_v", scX+sz(46), cty+sz(5), "50",     C_ORANGE, F_VAL, true);
-
-   // Signal row
-   int sry = cty + EMA_CTRL + sz(4);
-   Rect("d_ema_sig_bg", px+MH/2, sry, ema_inner_w, EMA_SIG, C_CARD2, C_BDR, 0);
-
-   // 3 cột đều trong ema_inner_w
-   int sigColW = ema_inner_w / 3;
-   int col0    = px + MH/2 + sz(6);
-   int col1    = px + MH/2 + sigColW;
-   int col2    = px + MH/2 + sigColW*2;
-
-   Lbl("d_ema_trl",  col0,        sry+sz(5), "TREND:",    C_MUTED,  F_BODY);
-   Lbl("d_ema_trv",  col0+sz(54), sry+sz(4), "---",       C_ORANGE, F_VAL,  true);
-
-   Rect("d_sig_s1",  col1-sz(6),  sry+sz(4), 1,sz(14),   C_MUTED2, C_MUTED2, 0);
-   Lbl("d_ema_sgl",  col1+sz(4),  sry+sz(5), "SIGNAL:",   C_MUTED,  F_BODY);
-   Lbl("d_ema_sgv",  col1+sz(62), sry+sz(4), "WAIT",      C_ORANGE, F_VAL,  true);
-
-   Rect("d_sig_s2",  col2-sz(6),  sry+sz(4), 1,sz(14),   C_MUTED2, C_MUTED2, 0);
-   Lbl("d_ema_stl",  col2+sz(4),  sry+sz(5), "STRENGTH:", C_MUTED,  F_BODY);
-   Lbl("d_ema_stv",  col2+sz(78), sry+sz(4), "---",       C_MUTED,  F_VAL,  true);
-
-   // Reason line
-   int rsy = sry + EMA_SIG;
-   Lbl("d_ema_rsn", px+MH+sz(4), rsy+sz(2), "...", C_MUTED, F_BODY);
-
-   // Score bar — sát đáy card EMA
-   int sbY = eby + EMA_CARD - EMA_SB - sz(2);
-   Rect("d_sbar_bg",   px+MH/2, sbY, ema_inner_w, EMA_SB, C_CARD2,C_CARD2, 0);
-   Rect("d_sbar_fill", px+MH/2, sbY, 0,           EMA_SB, C_GREEN,C_GREEN, 0);
-
-   // ════════════════════════════════════════════════════════════
-   //  SECTION C: STOP LOSS  &  AUTO CLOSE
-   // ════════════════════════════════════════════════════════════
-   int ccY  = eby + EMA_CARD + G_EMA_SL;   // Y label section
-   int ccyy = ccY + G_LBL;                 // Y bắt đầu 2 card
-
-   // Chia 2 card đều, cùng gap ở giữa như cg_
-   int hw  = (PW_ - MH - cg_) / 2;
-
-   Lbl("d_s_sl", px+MH+sz(2), ccY, "STOP LOSS  &  CLOSE", C_MUTED, F_SECT);
-
-   // Card SL (trái)
-   int slX = px + MH/2;
-   Rect("d_sl_c", slX, ccyy, hw, SL_H, C_CARD, C_BDR);
-   Rect("d_sl_t", slX, ccyy, hw, 2,    C_CYAN, C_CYAN, 0);
-   Lbl("d_sl_hd", slX+sz(6), ccyy+sz(9),            "STOP LOSS H1",   C_CYAN,  F_VAL,  true);
-   Lbl("d_sl_bl", slX+sz(6), ccyy+SL_H*28/100,      "BUY SL:",        C_MUTED, F_BODY);
-   Lbl("d_sl_bv", slX+sz(6)+sz(68), ccyy+SL_H*28/100,"---",           C_BLUE,  F_VAL,  true);
-   Lbl("d_sl_sl", slX+sz(6), ccyy+SL_H*50/100,      "SELL SL:",       C_MUTED, F_BODY);
-   Lbl("d_sl_sv", slX+sz(6)+sz(68), ccyy+SL_H*50/100,"---",           C_RED,   F_VAL,  true);
-   Lbl("d_sl_st", slX+sz(6), ccyy+SL_H*72/100,      "0 OK / 0 FAIL",  C_GREEN, F_BODY);
-   Lbl("d_sl_rt", slX+sz(6), ccyy+SL_H*86/100,      "",               C_MUTED, F_BODY);
-
-   // Card AutoClose (phải)
-   int clx = slX + hw + cg_;
-   Rect("d_cl_c", clx, ccyy, hw, SL_H, C_CARD, C_BDR);
-   Rect("d_cl_t", clx, ccyy, hw, 2,    C_YELLOW, C_YELLOW, 0);
-   Lbl("d_cl_hd", clx+sz(6), ccyy+sz(9),           "AUTO CLOSE",     C_YELLOW,F_VAL,  true);
-   Lbl("d_cl_ml", clx+sz(6), ccyy+SL_H*28/100,     "Phut dong:",     C_MUTED, F_BODY);
-   Lbl("d_cl_mv", clx+sz(6)+sz(80), ccyy+SL_H*28/100,
-       InpAutoClose?StringFormat(":%02d",InpCloseMinute):"OFF",
-       InpAutoClose?C_YELLOW:C_MUTED, F_VAL, true);
-   Lbl("d_cl_cdl",clx+sz(6), ccyy+SL_H*50/100,     "Countdown:",     C_MUTED, F_BODY);
-   Lbl("d_cl_cdv",clx+sz(6)+sz(80),ccyy+SL_H*50/100,"--",            C_CYAN,  F_VAL,  true);
-   Lbl("d_cl_st", clx+sz(6), ccyy+SL_H*72/100,     "0 OK / 0 FAIL",  C_GREEN, F_BODY);
-   Lbl("d_cl_be", clx+sz(6), ccyy+SL_H*86/100,
-       InpBEEnabled?StringFormat("BE: $%.0f >> +$%.0f",InpBETrigger,InpBELock):"BE: OFF",
-       InpBEEnabled?C_PURPLE:C_MUTED, F_BODY);
-
-   // ════════════════════════════════════════════════════════════
-   //  SECTION D: COUNTDOWN BAR
-   // ════════════════════════════════════════════════════════════
-   int dy = ccyy + SL_H + G_SLC;
-
-   // Progress bar: bắt đầu sau label "CLOSE TIMER:", kết thúc cách mép phải sz(6)
-   int cdLblW   = sz(105);                          // ước lượng chiều rộng chữ label
-   int cdbarX   = px + MH/2 + cdLblW;
-   int cdbarW   = PW_ - MH - cdLblW - sz(6);       // tự scale: không hardcode
-   int cdbarH   = sz(8);
-   int cdbarY   = dy + (CD_H - cdbarH) / 2;
-
-   Rect("d_cd_c",    px+MH/2, dy,     PW_-MH,  CD_H, C_CARD2,C_BDR);
-   Lbl("d_cd_lbl",   px+MH+sz(4), dy+sz(6), "CLOSE TIMER:", C_MUTED, F_BODY);
-   Rect("d_cd_bg",   cdbarX, cdbarY, cdbarW,  cdbarH, C'14,20,34',C_BDR);
-   Rect("d_cd_fill", cdbarX, cdbarY, 0,       cdbarH, C_GREEN,C_GREEN,0);
-   Lbl("d_cd_txt",   cdbarX+sz(4), dy+sz(6), "-- phut nua", C_WHITE, F_BODY, true);
-
-   // ════════════════════════════════════════════════════════════
-   //  SECTION E: BATCH STATUS BAR
-   // ════════════════════════════════════════════════════════════
-   int ey = dy + CD_H + G_CD_BT;
-   Rect("d_bt_bg", px+MH/2, ey, PW_-MH, BT_H, C_CARD2,C_BDR);
-   Lbl("d_bt_l",   px+MH+sz(4), ey+sz(5), "BATCH:",    C_MUTED, F_BODY);
-   Lbl("d_bt_v",   px+MH+sz(50),ey+sz(5), "STANDBY",   C_GREEN, F_BODY, true);
-
-   // Separator + BE info: không hardcode số tuyệt đối, dùng PW_ fraction
-   int sep1x = px + MH/2 + PW_/4;
-   int sep2x = px + MH/2 + PW_*3/4;
-   Lbl("d_bt_s1", sep1x,       ey+sz(5), "|",         C_MUTED2,F_BODY);
-   Lbl("d_bt_be", sep1x+sz(8), ey+sz(5),
-       InpBEEnabled?StringFormat("BE $%.0f>>+$%.0f",InpBETrigger,InpBELock):"BE:OFF",
-       InpBEEnabled?C_PURPLE:C_MUTED, F_BODY);
-   Lbl("d_bt_s2", sep2x,        ey+sz(5), "|",         C_MUTED2,F_BODY);
-   Lbl("d_bt_rt", sep2x+sz(8),  ey+sz(5),
-       StringFormat("Retry %dx%dms | Delay %dms",InpRetryCount,InpRetryDelay,InpBatchDelay),
-       C_MUTED, F_BODY);
-
-   // ════════════════════════════════════════════════════════════
-   //  SECTION F: LOG
-   // ════════════════════════════════════════════════════════════
-   int fy  = ey + BT_H + G_BT_LOG;
-   int lgy = fy + G_LBL;
-   Lbl("d_log_l",  px+MH+sz(2), fy, "JOURNAL", C_MUTED, F_SECT);
-   Rect("d_log_bg",px+MH/2, lgy, PW_-MH, InpMaxLog*RLOG_+sz(8), C'8,12,20',C_BDR);
-   for(int i=0;i<InpMaxLog;i++)
-      Lbl(StringFormat("d_log%d",i), px+MH+sz(4), lgy+sz(4)+i*RLOG_, "", C_MUTED, F_BODY);
-
-   // ════════════════════════════════════════════════════════════
-   //  FOOTER
-   // ════════════════════════════════════════════════════════════
-   int ffY = lgy + InpMaxLog*RLOG_ + sz(8) + G_LOG_FT;
-   Rect("d_ft_bg",  px,ffY, PW_,FT_H, C'10,13,20',C_BDR, 0);
-   Rect("d_ft_line",px,ffY, PW_,1,    C_GOLD2,C_GOLD2, 0);
-   Lbl("d_ft_sym",  px+MH+sz(4), ffY+sz(4), gSym,                         C_GOLD,  F_BODY, true);
-   Lbl("d_ft_s1",   px+sz(50),   ffY+sz(4), "|",                           C_MUTED2,F_BODY);
-   Lbl("d_ft_time", px+sz(58),   ffY+sz(4), "",                            C_MUTED, F_BODY);
-   Lbl("d_ft_s2",   px+PW_-sz(200),ffY+sz(4), "|",                         C_MUTED2,F_BODY);
-   Lbl("d_ft_srv",  px+PW_-sz(192),ffY+sz(4), "copyright by TVH-SMILE",    C_MUTED, F_BODY);
+   // ── FOOTER ──────────────────────────────────────────────
+   int ffY=sty+statH+lineH+G_FT;
+   Rect("d_ft_bg",  px,ffY,PW_,FT_H,C'10,13,20',C_BDR,0);
+   Rect("d_ft_line",px,ffY,PW_,1,   C_GOLD2,C_GOLD2,0);
+   Lbl("d_ft_sym",  px+MH+sz(4),ffY+sz(4),gSym,                      C_GOLD,  F_BODY,true);
+   Lbl("d_ft_s1",   px+sz(50),  ffY+sz(4),"|",                        C_MUTED2,F_BODY);
+   Lbl("d_ft_time", px+sz(58),  ffY+sz(4),"",                         C_MUTED, F_BODY);
+   Lbl("d_ft_s2",   px+PW_-sz(200),ffY+sz(4),"|",                     C_MUTED2,F_BODY);
+   Lbl("d_ft_srv",  px+PW_-sz(192),ffY+sz(4),"copyright by TVH-SMILE",C_MUTED, F_BODY);
 
    ChartRedraw(0);
 }
@@ -1140,26 +2045,13 @@ void BuildPanel()
 //======================================================================
 void PanelToggle()
 {
-   // Các object trong header luôn hiển thị (kể cả khi hidden)
-   // Tất cả object khác toggle theo gHidden
-   for(int i=0;i<ArraySize(gObjs);i++)
-   {
+   for(int i=0;i<ArraySize(gObjs);i++){
       string n=gObjs[i];
-      // Giữ lại: background, toàn bộ header, các nút scale, nút hide
-      if(n=="d_bg"||n=="d_sh"
-         ||n=="d_hdr_bg"||n=="d_hdr_line"
-         ||n=="d_hdr_title"||n=="d_hdr_pipe"||n=="d_hdr_sym"
-         ||n=="d_hdr_ver"||n=="d_hdr_status"||n=="d_hdr_clock"
-         ||n=="d_hdr_sizelbl"
-         ||n=="d_btn_hide"||n=="d_btn_hide_bg"
-         // Nút scale + active indicator
-         ||n=="d_btn_sc_s"  ||n=="d_btn_sc_s_bg"  ||n=="d_btn_sc_s_act"
-         ||n=="d_btn_sc_m"  ||n=="d_btn_sc_m_bg"  ||n=="d_btn_sc_m_act"
-         ||n=="d_btn_sc_l"  ||n=="d_btn_sc_l_bg"  ||n=="d_btn_sc_l_act"
-         ||n=="d_btn_sc_xl" ||n=="d_btn_sc_xl_bg" ||n=="d_btn_sc_xl_act"
-      ) continue;
-      ObjVis(n,!gHidden);
+      bool keepVisible=(n=="d_btn_hide"||n=="d_btn_hide_bg");
+      ObjVis(n, keepVisible ? true : !gHidden);
    }
+   if(gCanvasReady)
+      ObjectSetInteger(0,CANVAS_NAME,OBJPROP_TIMEFRAMES,gHidden?OBJ_NO_PERIODS:OBJ_ALL_PERIODS);
 }
 
 //======================================================================
@@ -1169,51 +2061,62 @@ void PanelUpdate()
 {
    MqlDateTime dt; TimeToStruct(TimeCurrent(),dt);
    ObjTxt("d_hdr_clock",TimeToString(TimeCurrent(),TIME_SECONDS));
-
    if(gHidden){ ChartRedraw(0); return; }
 
-   int    PW_     = sz(PW_BASE);
-   int    MH      = sz(MARGIN_H);
-   int    cg_     = sz(CARD_GAP);
-
-   double h1h=H1High(), h1l=H1Low();
-   double pt=SymbolInfoDouble(gSym,SYMBOL_POINT);
-   int    dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
-   double slS=NormalizeDouble(h1h+InpExtraPoints*pt,dg);
-   double slB=NormalizeDouble(h1l-InpExtraPoints*pt,dg);
-   int    pc=CntPos();
+   int PW_=sz(PW_BASE), MH=sz(MARGIN_H);
+   double m5hCur=M5High(),m5lCur=M5Low();
+   int dg=(int)SymbolInfoInteger(gSym,SYMBOL_DIGITS);
+   double slS=NormalizeDouble(m5hCur,dg);
+   double slB=NormalizeDouble(m5lCur,dg);
+   int pc=CntPos();
    double pnl=TotPnL();
-   int    ml=MnLeft();
-   bool   isClose=(dt.min==InpCloseMinute&&InpAutoClose);
-   bool   isWarn =(ml<=InpCloseWarning&&ml>0&&InpAutoClose);
+   double m5h=m5hCur,m5l=m5lCur;
+   bool hasCloseSignal=(InpAutoClose&&dt.min==InpCloseMinute);
 
    if(gBatchRunning)   { ObjTxt("d_hdr_status","[BUSY]");    ObjClr("d_hdr_status",C_ORANGE); }
-   else if(isClose)    { ObjTxt("d_hdr_status","[CLOSING]"); ObjClr("d_hdr_status",C_RED);    }
+   else if(hasCloseSignal){ ObjTxt("d_hdr_status","[CLOSING]"); ObjClr("d_hdr_status",C_RED); }
    else                { ObjTxt("d_hdr_status","[RUNNING]"); ObjClr("d_hdr_status",C_GREEN);  }
 
-   // Cập nhật highlight nút scale theo gDashScale hiện tại
-   string scIds2[4]  = {"d_btn_sc_s","d_btn_sc_m","d_btn_sc_l","d_btn_sc_xl"};
-   int    scVals2[4] = {80,100,120,150};
-   for(int i=0;i<4;i++)
-   {
-      bool active = (scVals2[i] == gDashScale);
-      ObjClr(scIds2[i], active ? C_GOLD : C_MUTED);
-      ObjectSetInteger(0, scIds2[i]+"_bg", OBJPROP_BGCOLOR, active ? C'30,38,56' : C_CARD);
+   string scIds2[4]={"d_btn_sc_s","d_btn_sc_m","d_btn_sc_l","d_btn_sc_xl"};
+   int    scVals2[4]={80,100,120,150};
+   for(int i=0;i<4;i++){
+      bool active=(scVals2[i]==gDashScale);
+      ObjClr(scIds2[i],active?C_GOLD:C_MUTED);
+      ObjectSetInteger(0,scIds2[i]+"_bg",OBJPROP_BGCOLOR,active?C'30,38,56':C_CARD);
    }
 
-   // Metric cards
-   ObjTxt("d_c1v",(string)pc);  ObjClr("d_c1v",pc>0?C_WHITE:C_MUTED);  ObjTxt("d_c1s",pc>0?"lenh mo":"trong");
-   string ps=(pnl>=0?"+":"")+DoubleToString(pnl,2);
-   ObjTxt("d_c2v",ps); ObjClr("d_c2v",pnl>0?C_GREEN:pnl<0?C_RED:C_MUTED);
-   ObjectSetInteger(0,"d_c2t",OBJPROP_BGCOLOR,pnl>0?C_GREEN:pnl<0?C_RED:C_BDR);
-   ObjectSetInteger(0,"d_c2t",OBJPROP_COLOR,  pnl>0?C_GREEN:pnl<0?C_RED:C_BDR);
-   ObjTxt("d_c3v",(string)statSLOk);
-   ObjTxt("d_c4v",(string)statBEOk); ObjClr("d_c4v",statBEOk>0?C_PURPLE:C_MUTED);
-
-   // EMA signal
-   EmaSnap ema; Signal sig;
-   if(GetEMA(ema))
+   if(gLastCrossType!="")
    {
+      color ltClr = (gLastCrossType=="GOLDEN") ? C_GREEN : C_RED;
+      string ltTxt = "Last: "+gLastCrossType+" "+TimeToString(iTime(gSym,PERIOD_M5,1),TIME_MINUTES);
+      ObjTxt("d_ae_last",ltTxt);
+      ObjClr("d_ae_last",ltClr);
+   }
+   else
+   {
+      ObjTxt("d_ae_last","Last: ---");
+      ObjClr("d_ae_last",C_MUTED2);
+   }
+
+   ObjTxt("d_btn_ae", gAutoEntry ? "AUTO ENTRY: ON" : "AUTO ENTRY: OFF");
+   ObjTxt("d_ema_fval",(string)gEmaFast);
+   ObjTxt("d_ema_mval",(string)gEmaMid);
+   ObjTxt("d_ema_sval",(string)gEmaSlow);
+   ObjTxt("d_days_val",(string)gAnalysisDays+"D");
+   if(gManualPlanTime<=0)
+   {
+      ObjTxt("d_btn_candle","ANALYZE "+(string)gAnalysisDays+"D");
+      ObjClr("d_btn_candle",C_CYAN);
+      ObjectSetInteger(0,"d_btn_candle_bg",OBJPROP_BGCOLOR,C'14,22,34');
+      ObjectSetInteger(0,"d_btn_candle_bg",OBJPROP_COLOR,C_CYAN);
+      ObjTxt("d_btn_limit","LIMIT");
+      ObjClr("d_btn_limit",C_GREEN);
+      ObjectSetInteger(0,"d_btn_limit_bg",OBJPROP_BGCOLOR,C'16,28,20');
+      ObjectSetInteger(0,"d_btn_limit_bg",OBJPROP_COLOR,C_GREEN);
+   }
+
+   EmaSnap ema; Signal sig;
+   if(GetEMA(ema)){
       sig=Analyze(ema);
       ObjTxt("d_ema_shbdg",sig.trend); ObjClr("d_ema_shbdg",sig.tc);
       ObjTxt("d_ema_trv",sig.trend);   ObjClr("d_ema_trv",sig.tc);
@@ -1222,60 +2125,46 @@ void PanelUpdate()
       ObjClr("d_ema_stv",sig.str=="MANH"?C_GREEN:sig.str=="TRUNG BINH"?C_YELLOW:C_ORANGE);
       ObjTxt("d_ema_rsn",sig.reason);
       ObjTxt("d_ema_score_v",(string)sig.score); ObjClr("d_ema_score_v",sig.tc);
-
-      // Score bar — chiều rộng tỉ lệ theo ema_inner_w
-      int ema_inner_w = PW_ - MH;
-      ObjW("d_sbar_fill",(int)(ema_inner_w * sig.score / 100.0));
+      ObjTxt("d_mid_signal",sig.sig); ObjClr("d_mid_signal",sig.sc);
+      ObjTxt("d_mid_trend",sig.trend); ObjClr("d_mid_trend",sig.tc);
+      ObjTxt("d_mid_meta",StringFormat("Score %d | %s",sig.score,sig.str));
+      ObjClr("d_mid_meta",sig.str=="MANH"?C_GREEN:sig.str=="TRUNG BINH"?C_YELLOW:C_MUTED);
+      int ema_inner_w=PW_-MH;
+      ObjW("d_sbar_fill",(int)(ema_inner_w*sig.score/100.0));
       ObjBg("d_sbar_fill",sig.tc);
+
+      if(gManualPlanActive && gManualPlan.ready)
+      {
+         ObjTxt("d_plan_txt",StringFormat("Entry %s: %.2f",gManualPlan.dir,gManualPlan.entry));
+         ObjClr("d_plan_txt",gManualPlan.clr);
+         ObjTxt("d_risk_txt",StringFormat("SL %.2f | TP %.2f",gManualPlan.sl,gManualPlan.tp));
+         ObjClr("d_risk_txt",C_MUTED);
+      }
+      else
+      {
+         ObjTxt("d_plan_txt","Entry: ---");
+         ObjClr("d_plan_txt",C_MUTED);
+         ObjTxt("d_risk_txt","SL/TP: ---");
+         ObjClr("d_risk_txt",C_MUTED);
+      }
    }
 
-   // SL card
-   ObjTxt("d_sl_bv",DoubleToString(slB,2));
-   ObjTxt("d_sl_sv",DoubleToString(slS,2));
-   int slt=statSLOk+statSLFail;
-   ObjTxt("d_sl_st",StringFormat("%d OK / %d FAIL (%d%%)",statSLOk,statSLFail,slt>0?(int)(statSLOk*100.0/slt):0));
-   ObjClr("d_sl_st",statSLFail>0?C_ORANGE:C_GREEN);
-   ObjTxt("d_sl_rt",StringFormat("Buffer: %.0f pts",InpExtraPoints));
+   string ps=(pnl>=0?"+":"")+DoubleToString(pnl,2);
+   ObjTxt("d_stat_pos",StringFormat("Pos: %d",pc));
+   ObjTxt("d_stat_pnl",StringFormat("PnL: %s",ps));
+   ObjClr("d_stat_pnl",pnl>0?C_GREEN:pnl<0?C_RED:C_MUTED);
+   ObjTxt("d_stat_sl",StringFormat("SL B:%.2f | S:%.2f",slB,slS));
+   ObjTxt("d_stat_lv",StringFormat("M5: %.2f / %.2f",m5h,m5l));
 
-   // Close card
-   string cds; color cdc;
-   if(isClose)    { cds="DONG NGAY!";                      cdc=C_RED;    }
-   else if(isWarn){ cds=StringFormat("!! %d PHUT !!",ml);  cdc=C_ORANGE; }
-   else           { cds=StringFormat("%d phut nua",ml);     cdc=C_CYAN;   }
-   ObjTxt("d_cl_cdv",cds); ObjClr("d_cl_cdv",cdc);
-   ObjTxt("d_cl_st",StringFormat("%d OK / %d FAIL",statClOk,statClFail));
-   ObjClr("d_cl_st",statClFail>0?C_ORANGE:C_GREEN);
-
-   // Countdown bar — cdbarW phải tính giống BuildPanel
-   int cdLblW  = sz(105);
-   int cdbarW  = PW_ - MH - cdLblW - sz(6);
-   ObjW("d_cd_fill", MathMax(0, MathMin((int)(cdbarW*(1.0-ml/60.0)), cdbarW)));
-   color bc = isClose?C_RED:isWarn?C_ORANGE:C_GREEN;
-   ObjBg("d_cd_fill",bc);
-   int s2c=ml*60-dt.sec; if(s2c<0)s2c=0;
-   ObjTxt("d_cd_txt",StringFormat("%02d:%02d den phut :%02d",s2c/60,s2c%60,InpCloseMinute));
-   ObjClr("d_cd_txt",bc);
-
-   // Batch bar
-   if(gBatchRunning)      { ObjTxt("d_bt_v","PROCESSING..."); ObjClr("d_bt_v",C_ORANGE); }
-   else if(isClose&&pc>0) { ObjTxt("d_bt_v","CLOSING ALL");   ObjClr("d_bt_v",C_RED);    }
-   else if(isWarn&&pc>0)  { ObjTxt("d_bt_v",StringFormat("WARN -%dmin",ml)); ObjClr("d_bt_v",C_ORANGE); }
-   else                   { ObjTxt("d_bt_v","STANDBY");        ObjClr("d_bt_v",C_GREEN);  }
-
-   // Log
-   int lsz=ArraySize(gLog);
-   for(int i=0;i<InpMaxLog;i++)
-   {
-      int idx=lsz-InpMaxLog+i;
-      if(idx<0||idx>=lsz){ ObjTxt(StringFormat("d_log%d",i),""); continue; }
-      string raw=gLog[idx];
-      int pipe=StringFind(raw,"|",StringLen(raw)-5);
-      string txt=pipe>=0?StringSubstr(raw,0,pipe):raw;
-      string typ=pipe>=0?StringSubstr(raw,pipe+1):"info";
-      color lc=(typ=="ok")?C_GREEN:(typ=="err")?C_RED:(typ=="warn")?C_ORANGE:C_MUTED;
-      ObjTxt(StringFormat("d_log%d",i),txt);
-      ObjClr(StringFormat("d_log%d",i),lc);
-   }
+   string lineTxt;
+   color lineClr=C_MUTED;
+   if(gBatchRunning) { lineTxt="Processing orders..."; lineClr=C_ORANGE; }
+   else if(hasCloseSignal&&pc>0) { lineTxt=StringFormat("AutoClose time active at minute %02d",InpCloseMinute); lineClr=C_RED; }
+   else if(gManualPlanText!="") { lineTxt=gManualPlanText; lineClr=gManualPlanActive?gManualPlan.clr:C_ORANGE; }
+   else if(gLastCrossType!="") { lineTxt="Last cross: "+gLastCrossType; lineClr=(gLastCrossType=="GOLDEN")?C_GREEN:C_RED; }
+   else lineTxt="Waiting for confirmed M5 signal";
+   ObjTxt("d_line_txt",lineTxt);
+   ObjClr("d_line_txt",lineClr);
 
    ObjTxt("d_ft_time",TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS));
    ChartRedraw(0);
